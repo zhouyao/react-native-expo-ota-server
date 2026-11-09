@@ -1,0 +1,22 @@
+{
+  "name": "hotupdate-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "prebuild": "expo prebuild",
+    "export": "expo export --platform all --output-dir dist",
+    "deps:check": "expo install --check",
+    "deps:fix": "expo install --fix"
+  },
+  "dependencies": {
+    "expo": "~58.0.0",
+    "expo-constants": "~58.0.15",
+    "expo-updates": "~58.0.21",
+    "react": "19.3.0",
+    "react-native": "0.88.1"
+  }
+}

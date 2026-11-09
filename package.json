@@ -1,0 +1,24 @@
+{
+  "name": "react-native-expo-ota-server",
+  "version": "1.0.0",
+  "description": "Self-hosted Expo Updates v1 server for React Native apps on iOS and Android",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "ota:start": "node services/ota/src/server.mjs",
+    "ota:publish": "node scripts/publish.mjs",
+    "ota:hotfix": "node scripts/hotfix.mjs",
+    "ota:verify": "node scripts/verify-manifest.mjs",
+    "ota:preflight": "node scripts/preflight.mjs",
+    "ota:rollout": "node scripts/rollout.mjs",
+    "ota:rollback": "node scripts/rollback.mjs",
+    "ota:keygen": "node scripts/keygen.mjs",
+    "mobile:start": "npm --prefix apps/mobile run start",
+    "mobile:export": "npm --prefix apps/mobile run export",
+    "mobile:android": "npm --prefix apps/mobile run android",
+    "mobile:ios": "npm --prefix apps/mobile run ios",
+    "mobile:ios:dev": "node scripts/dev-ios.mjs",
+    "mobile:android:dev": "node scripts/dev-android.mjs",
+    "test": "node --test tests/*.test.mjs"
+  }
+}

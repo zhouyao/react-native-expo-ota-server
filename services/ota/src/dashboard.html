@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>OTA 更新控制台</title>
+<style>
+*{box-sizing:border-box}
+:root{--gutter:24px;--radius:12px;--shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06)}
+body{margin:0;min-height:100vh;padding:0 var(--gutter) 40px;background:#f5f7fa;color:#111827;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;-webkit-font-smoothing:antialiased}
+h1{font-size:19px;margin:0;white-space:nowrap}
+h2{font-size:15px;margin:0 0 12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+header{position:sticky;top:0;z-index:30;background:#fff;border-bottom:1px solid #e5e7eb;padding:10px var(--gutter) 0;margin:0 calc(-1 * var(--gutter)) 0}
+main{width:100%;padding-top:16px}
+section,.stat,.ch{background:#fff;border:1px solid #e5e7eb;border-radius:var(--radius);padding:16px;margin-bottom:16px;box-shadow:var(--shadow)}
+section{margin-bottom:0}
+.row{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap;padding-bottom:10px}
+.tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;min-width:0}
+.badge{font-size:12px;color:#1d4ed8;background:#eff6ff;border:1px solid #bfdbfe;border-radius:999px;padding:2px 10px}
+.badge.ro{color:#92400e;background:#fef3c7;border-color:#fde68a}
+.meta,footer{font-size:12px;color:#6b7280}
+select,button,input{font:inherit;padding:6px 10px;border:1px solid #d1d5db;border-radius:8px;background:#fff;color:#111827;transition:border-color .15s,box-shadow .15s,background .15s}
+select:focus-visible,button:focus-visible,input:focus-visible{outline:none;border-color:#1d4ed8;box-shadow:0 0 0 3px rgba(29,78,216,.15)}
+input[type=number]{width:76px}input[type=text]{width:180px}
+button:disabled,input:disabled,select:disabled{opacity:.45;cursor:not-allowed}
+button:not(:disabled),summary{cursor:pointer}
+button:not(:disabled):hover{background:#f9fafb}
+button.primary:not(:disabled){background:#1d4ed8;border-color:#1d4ed8;color:#fff}
+button.primary:not(:disabled):hover{background:#1e40af;border-color:#1e40af}
+button.mini{font-size:12px;padding:2px 8px}
+.warn{color:#92400e;background:#fef3c7;border:1px solid #fde68a;padding:8px 10px;border-radius:8px;margin-bottom:8px;font-size:12px}
+/* Tab */
+nav.tabs{display:flex;gap:4px;overflow-x:auto;padding:4px 0 0;margin:0 calc(-1 * var(--gutter));padding-left:var(--gutter);padding-right:var(--gutter);scrollbar-width:none}
+nav.tabs::-webkit-scrollbar{display:none}
+nav.tabs a{flex:0 0 auto;padding:8px 14px;border-radius:10px 10px 0 0;color:#4b5563;text-decoration:none;font-size:13px;border:1px solid transparent;border-bottom:none;display:flex;align-items:center;gap:6px;transition:background .15s,color .15s}
+nav.tabs a:hover{background:#f3f4f6;color:#111827}
+nav.tabs a.active{background:#f6f7f9;border-color:#e5e7eb;color:#1d4ed8;font-weight:600}
+nav.tabs .count{font-size:11px;background:#e5e7eb;color:#4b5563;border-radius:999px;padding:0 7px;font-weight:400}
+nav.tabs a.active .count{background:#dbeafe;color:#1e40af}
+/* 设置弹层 */
+details.settings{position:relative}
+details.settings>summary{list-style:none;font-size:13px;color:#374151;border:1px solid #d1d5db;border-radius:8px;padding:6px 10px;background:#fff}
+details.settings>summary::-webkit-details-marker{display:none}
+details.settings[open]>summary{border-color:#1d4ed8;color:#1d4ed8}
+details.settings .panel{position:absolute;right:0;top:120%;width:340px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:14px;box-shadow:0 12px 32px rgba(0,0,0,.14);z-index:40;max-width:calc(100vw - 32px)}
+details.settings .panel label{display:block;font-size:12px;color:#6b7280;margin-bottom:8px}
+details.settings .panel input{width:100%;margin-top:4px;padding:6px 8px;border:1px solid #d1d5db;border-radius:8px}
+details.settings .panel .hint{font-size:12px;color:#6b7280;margin-top:8px;line-height:1.5}
+/* 概览 */
+.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}
+.stat{padding:12px 16px;margin:0;display:flex;flex-direction:column;justify-content:center}
+.stat b{display:block;font-size:22px;line-height:1.25;font-variant-numeric:tabular-nums}
+.stat span{font-size:12px;color:#6b7280}
+.overview{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,.8fr);gap:16px;margin-bottom:16px}
+.overview .stat{height:100%}
+/* 表格 */
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #f3f4f6;vertical-align:top}
+th{color:#6b7280;font-size:12px;font-weight:600;white-space:nowrap;background:#fff}
+tbody tr{transition:background .12s}
+tbody tr:hover{background:#f9fafb}
+tr:last-child td{border-bottom:none}
+.table-wrap{max-height:min(62vh,720px);overflow:auto;border:1px solid #f3f4f6;border-radius:10px;-webkit-overflow-scrolling:touch}
+.table-wrap thead th{position:sticky;top:0;z-index:1;box-shadow:inset 0 -1px 0 #f3f4f6}
+.table-wrap::-webkit-scrollbar{width:8px;height:8px}
+.table-wrap::-webkit-scrollbar-thumb{background:#d1d5db;border-radius:999px}
+.tag{display:inline-block;font-size:11px;border-radius:6px;padding:1px 7px;margin:1px 4px 1px 0;white-space:nowrap}
+.green{background:#dcfce7;color:#166534}.blue{background:#dbeafe;color:#1e40af}
+.amber{background:#fef3c7;color:#92400e}.red{background:#fee2e2;color:#991b1b}
+.gray{background:#f3f4f6;color:#4b5563}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+.empty{color:#9ca3af}
+code{font-family:ui-monospace,Menlo,monospace}
+.bar{height:6px;background:#e5e7eb;border-radius:999px;overflow:hidden;margin:6px 0 10px;max-width:260px}
+.bar i{display:block;height:100%;background:#1d4ed8}
+.inline{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+/* Channels：页内 Tab 切换通道，单个面板内按功能分区 */
+#channels{display:flex;flex-direction:column;gap:12px}
+.channel-tabs{display:flex;gap:4px;overflow-x:auto;padding:4px;background:#f3f4f6;border-radius:10px;scrollbar-width:none}
+.channel-tabs::-webkit-scrollbar{display:none}
+.channel-tab{flex:1 0 88px;min-width:0;overflow:hidden;text-overflow:ellipsis;border-color:transparent;background:transparent;color:#6b7280;padding:8px 16px;white-space:nowrap}
+.channel-tabs .channel-tab:not(.active):not(:disabled):hover{background:#e9edf3;color:#111827}
+.channel-tabs .channel-tab.active{background:#fff;border-color:#e5e7eb;color:#1d4ed8;font-weight:600;box-shadow:0 1px 2px rgba(16,24,40,.06)}
+.ch{margin:0;padding:16px;border:1px solid #e5e7eb;border-radius:10px;box-shadow:none;background:#fff}
+.ch-head{display:flex;align-items:center;justify-content:space-between;gap:8px 16px;flex-wrap:wrap;margin-bottom:10px}
+.ch-title,.ch-head-meta,.ch-platform-name{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ch-title b{font-size:16px}
+.ch-total,.ch-updated{font-size:11px;color:#6b7280;white-space:nowrap}
+.ch-versions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:12px}
+.ch-version{display:flex;align-items:center;gap:7px;min-width:0;padding:7px 9px;background:#f9fafb;border-radius:8px;font-size:11px;color:#6b7280}
+.ch-version-label{flex:0 0 auto}
+.ch-release{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#374151}
+.ch-version .mini{flex:0 0 auto;margin-left:auto}
+.ch-body{display:grid;gap:12px}
+.ch-section{padding:12px;background:#fbfcfe;border:1px solid #f3f4f6;border-radius:9px}
+.ch-section-head{display:flex;align-items:center;justify-content:space-between;gap:8px 12px;flex-wrap:wrap;margin-bottom:10px}
+.ch-section-head h3{font-size:13px;margin:0}
+.ch-section-head p{font-size:11px;color:#6b7280;margin:2px 0 0}
+.ch-platforms{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.ch-platform{min-width:0;padding:10px;background:#fff;border:1px solid #e5e7eb;border-radius:8px}
+.ch-platform-head{display:flex;align-items:center;gap:8px}
+.ch-platform b{font-size:12px}
+.ch-platform .tag{font-size:10px;padding:0 6px;margin:0}
+.ch-effective{margin-left:auto;font-size:12px;color:#1d4ed8;font-weight:600;font-variant-numeric:tabular-nums}
+.ch-control{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px;font-size:12px;color:#6b7280}
+.ch-percent{display:flex;align-items:center;gap:5px}
+.ch-percent input[type=number]{width:72px;padding:5px 7px;text-align:right}
+.ch-presets{display:flex;gap:5px;margin:8px 0}
+.ch-presets button{flex:1;min-width:0;padding:3px 5px}
+.ch-platform .bar{width:100%;max-width:none;height:5px;margin:0 0 8px}
+.ch-stat{display:flex;justify-content:space-between;gap:8px;font-size:11px;color:#6b7280;font-variant-numeric:tabular-nums}
+.ch-stat b{color:#374151;font-weight:500;text-align:right}
+.ch-stat-detail{margin-top:2px;font-size:10px;color:#9ca3af;text-align:right}
+.ch-body button,.ch-body select{padding:5px 10px;font-size:12px}
+.ch-whitelist{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ch-whitelist input[type=text]{flex:1 1 280px;width:auto;min-width:0;padding:6px 9px;font-size:12px}
+.ch-release-actions{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.ch-promote{flex:1 1 340px;min-width:0}
+.ch-promote>label{display:block;margin-bottom:5px;font-size:11px;color:#6b7280}
+.ch-promote .inline{flex-wrap:nowrap}
+.ch-promote select{flex:1;min-width:0;max-width:460px}
+.ch-secondary-actions{display:flex;gap:8px;flex-wrap:wrap}
+.ch-history{margin:0;padding:10px 2px 0;border-top:1px dashed #e5e7eb}
+.ch-history summary{font-size:12px;color:#6b7280;margin:0}
+.ch-history[open] summary{margin-bottom:8px;color:#1d4ed8}
+.ch-history summary:hover{color:#1d4ed8}
+.history{margin:0;padding-left:18px;font-size:12px;color:#4b5563}
+.history li+li{margin-top:5px}
+.history .meta{margin-left:6px}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+/* 图表 */
+.days{display:flex;align-items:flex-end;justify-content:space-around;gap:6px;height:110px;margin:8px 0}
+.day{display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;font-size:11px;color:#6b7280}
+.daybar{display:flex;align-items:flex-end;gap:2px;height:88px}
+.daybar i{display:block;width:9px;border-radius:3px 3px 0 0}
+.daybar i.cur{background:#1d4ed8}.daybar i.prev{background:#93c5fd}
+.legend{font-size:12px;color:#6b7280;margin-bottom:6px}
+.pager{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12px;color:#6b7280}
+.toast{position:fixed;right:16px;bottom:16px;z-index:50;display:flex;flex-direction:column;gap:8px}
+.toast div{padding:10px 14px;border-radius:10px;font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.12);background:#111827;color:#fff;max-width:340px}
+.toast div.ok{background:#166534}.toast div.err{background:#991b1b}.toast div.warn{background:#92400e}
+pre{white-space:pre-wrap;word-break:break-all;font-size:11px;background:#f9fafb;padding:8px;border-radius:8px;margin:4px 0 0}
+[hidden]{display:none !important}
+/* 响应式：默认铺满视口，宽屏多列，小屏纵向堆叠 */
+@media(max-width:1100px){
+  .overview{grid-template-columns:1fr}
+}
+@media(max-width:900px){
+  .stats{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .ch-versions{grid-template-columns:1fr}
+}
+@media(max-width:760px){
+  :root{--gutter:12px}
+  body{padding-bottom:24px}
+  header{padding:8px var(--gutter) 0}
+  .row{gap:8px}
+  .tools{width:100%}
+  #rv{flex:1 1 140px;min-width:0}
+  #updated{flex:1 1 100%;order:9}
+  .stat b{font-size:19px}
+  .table-wrap{max-height:none}
+  table{min-width:680px}
+  .ch-head-meta{width:100%;justify-content:space-between}
+  .ch-platforms{grid-template-columns:1fr}
+  .ch-promote{flex-basis:100%}
+  .ch-secondary-actions{width:100%}
+  .ch-secondary-actions button{flex:1}
+  .pager{flex-wrap:wrap}
+  .toast{left:12px;right:12px}
+  .toast div{max-width:none}
+}
+@media(max-width:520px){
+  .stats{grid-template-columns:1fr}
+  h1{font-size:17px;white-space:normal}
+  .tools>#rv,.tools>details.settings{flex:1 1 100%}
+  details.settings .panel{width:100%}
+  .channel-tabs{gap:2px;padding:3px}
+  .channel-tab{flex:1 1 0;padding:8px 2px;font-size:12px}
+  .ch{padding:12px}
+  .ch-section{padding:10px}
+  .ch-section-head>.primary,.ch-whitelist button,.ch-promote button{width:100%}
+  .ch-promote .inline{flex-wrap:wrap}
+  .ch-promote select{flex-basis:100%;max-width:none}
+  .ch-total,.ch-updated{white-space:normal}
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <h1>OTA 更新控制台 <span id="mode" class="badge"></span></h1>
+    <div class="tools">
+      <select id="rv" title="runtimeVersion"></select>
+      <label class="meta"><input id="auto" type="checkbox" checked> 自动刷新（15s）</label>
+      <button type="button" id="refresh">刷新</button>
+      <span id="updated" class="meta"></span>
+      <details class="settings" id="settings">
+        <summary>设置</summary>
+        <div class="panel">
+          <div id="adminHint"></div>
+          <label>管理令牌
+            <input id="token" type="password" autocomplete="off" placeholder="OTA_ADMIN_TOKEN">
+          </label>
+          <div class="inline">
+            <button type="button" id="saveToken">保存到本机</button>
+            <span id="tokenHint" class="meta"></span>
+          </div>
+          <div class="hint">写操作复用 <code>scripts/publish.mjs</code>：提升 = 基于历史版本重新发布并刷新时间戳；回滚 = 回到 previous；重新发布 = 刷新当前版本时间戳。</div>
+        </div>
+      </details>
+    </div>
+  </div>
+  <div class="meta" id="subline"></div>
+  <nav class="tabs" id="tabs">
+    <a href="#overview" data-tab="overview">概览</a>
+    <a href="#channels" data-tab="channels">通道 <span class="count" id="tabChannels">-</span></a>
+    <a href="#updates" data-tab="updates">版本 <span class="count" id="tabUpdates">-</span></a>
+    <a href="#metrics" data-tab="metrics">指标</a>
+    <a href="#events" data-tab="events">事件 <span class="count" id="tabEvents">-</span></a>
+  </nav>
+</header>
+<main>
+  <div class="stats" id="stats"></div>
+
+  <section data-tab-panel="overview">
+    <div class="overview">
+      <div class="stat">
+        <h2>7 天请求趋势</h2>
+        <div id="trend"></div>
+      </div>
+      <div class="stat">
+        <h2>通道状态</h2>
+        <div id="overviewChannels"></div>
+      </div>
+    </div>
+    <div class="stat">
+      <h2>最近事件 <span class="meta">（最近 5 条，不受事件页筛选影响）</span></h2>
+      <div id="overviewEvents"></div>
+    </div>
+  </section>
+
+  <section data-tab-panel="channels" hidden>
+    <h2>通道 Channels <span class="meta">集中管理灰度、白名单与版本发布</span> <span class="meta" id="channelsHint"></span></h2>
+    <div id="channels"></div>
+  </section>
+
+  <section data-tab-panel="updates" hidden>
+    <h2>Updates <span class="meta" id="updatesHint"></span></h2>
+    <div id="updates"></div>
+  </section>
+
+  <section data-tab-panel="metrics" hidden>
+    <h2>Metrics（最近 7 天）</h2>
+    <div id="metrics"></div>
+  </section>
+
+  <section data-tab-panel="events" hidden>
+    <h2>Events <span class="meta" id="eventsHint"></span></h2>
+    <div id="events"></div>
+  </section>
+
+  <footer class="meta" style="margin-top:16px">接口：<a href="/api/admin/state">/api/admin/state</a> · <a href="/api/channels">/api/channels</a> · <a href="/api/metrics">/api/metrics</a></footer>
+</main>
+<div id="toast" class="toast"></div>
+<noscript><div class="warn">控制台需要 JavaScript，且该页面不再使用整页自动刷新。</div></noscript>
+<script id="dashboard-state" type="application/json">__OTA_DASHBOARD_BOOT__</script>
+<script src="/dashboard.js" defer></script>
+</body>
+</html>
