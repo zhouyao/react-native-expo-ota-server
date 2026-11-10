@@ -2,14 +2,14 @@ import React, { useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { colors, radius, shadow, spacing } from '../theme';
 
-export function DebugRow({ label, value, warn = false }) {
+export function DebugRow({ label, value, warn = false, multiline = false }) {
   return (
     <View style={styles.row}>
       <Text style={styles.label}>{label}</Text>
       <Text
         style={[styles.value, warn ? styles.valueWarn : null]}
         selectable
-        numberOfLines={1}
+        numberOfLines={multiline ? undefined : 1}
       >
         {String(value ?? '-')}
       </Text>

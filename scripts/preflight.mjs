@@ -39,6 +39,7 @@ function parseArgs(argv) {
     keyid: process.env.OTA_KEY_ID || 'main',
     maxAssets: 50,
     quiet: false,
+    patchBase: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const key = argv[i];
@@ -51,9 +52,11 @@ function parseArgs(argv) {
     else if (key === '--keyid') args.keyid = argv[++i];
     else if (key === '--max-assets') args.maxAssets = Number(argv[++i]) || 50;
     else if (key === '--quiet') args.quiet = true;
+    else if (key === '--patch-base') args.patchBase = argv[++i];
     else if (key === '--help' || key === '-h') {
       console.log(`用法: node scripts/preflight.mjs --channel <name> [--rv <rv>] [--url <base>]
-  [--cert <pem>] [--platform all|ios|android] [--uid <uid>] [--max-assets N] [--quiet]`);
+  [--cert <pem>] [--platform all|ios|android] [--uid <uid>] [--max-assets N] [--quiet]
+  [--patch-base <updateId>]  额外检查差分协商（226 / IM / Vary）`);
       process.exit(0);
     }
   }
@@ -146,6 +149,49 @@ async function verifyResource(resource, label) {
 }
 
 /**
+ * 差分协商检查：226 命中与 200 回退都算通过（补丁可能尚未生成），
+ * 但响应必须声明 Vary: A-IM，避免 CDN 把补丁串给普通请求。
+ */
+async function verifyPatchResource(resource, label, baseUpdateId, platform) {
+  if (!resource?.url) return;
+  const response = await fetch(resource.url, {
+    headers: {
+      'a-im': 'bsdiff',
+      'expo-current-update-id': String(baseUpdateId).toLowerCase(),
+      'expo-embedded-update-id': String(baseUpdateId).toLowerCase(),
+      'expo-platform': platform,
+      'expo-protocol-version': '1',
+      'accept-encoding': 'identity',
+    },
+  });
+  check(
+    response.status === 226 || response.status === 200,
+    `${label} 差分协商可用`,
+    `HTTP ${response.status}`,
+  );
+  check(
+    (response.headers.get('vary') || '').includes('a-im'),
+    `${label} 声明 Vary: A-IM`,
+  );
+  if (response.status === 226) {
+    check(
+      (response.headers.get('im') || '').includes('bsdiff'),
+      `${label} 返回 IM: bsdiff`,
+    );
+    check(
+      (response.headers.get('expo-base-update-id') || '').toLowerCase() ===
+        String(baseUpdateId).toLowerCase(),
+      `${label} Expo-Base-Update-ID 一致`,
+    );
+    const buffer = Buffer.from(await response.arrayBuffer());
+    check(
+      buffer.subarray(0, 8).toString('ascii') === 'BSDIFF40',
+      `${label} 补丁为 BSDIFF40`,
+    );
+  }
+}
+
+/**
  * 通道存在性：服务端对未显式发布的通道会继承默认通道（这是刻意的灰度设计），
  * 所以拼错通道同样会返回 200，必须单独校验，否则自检形同虚设。
  */
@@ -232,6 +278,9 @@ async function verifyPlatform(platform, args) {
   await verifySignature(body, response.headers.get('expo-signature'), args.cert);
 
   await verifyResource(manifest.launchAsset, 'launchAsset');
+  if (args.patchBase) {
+    await verifyPatchResource(manifest.launchAsset, 'launchAsset', args.patchBase, platform);
+  }
   const assets = (manifest.assets || []).slice(0, args.maxAssets);
   for (let i = 0; i < assets.length; i += 1) {
     await verifyResource(assets[i], `asset#${i + 1}`);

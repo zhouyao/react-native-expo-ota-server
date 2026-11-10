@@ -91,6 +91,9 @@ module.exports = {
         keyid: 'main',
         alg: 'rsa-v1_5-sha256',
       },
+      // SDK 55+ 默认开启 bsdiff 补丁；显式声明避免后续升级时被误关。
+      // 服务端实现 A-IM 协商后，客户端只下载差异部分并本地还原。
+      enableBsdiffPatchSupport: true,
       checkAutomatically: 'ON_LOAD',
       fallbackToCacheTimeout: 0,
       // 内部调试：允许运行时覆盖 requestHeaders（切通道）；生产构建应关闭。

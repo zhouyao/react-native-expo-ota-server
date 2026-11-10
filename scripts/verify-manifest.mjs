@@ -13,6 +13,7 @@ function parseArgs(argv) {
     expectServed: null,
     expectRollback: false,
     cert: process.env.OTA_CODE_SIGNING_CERT || null,
+    patchBase: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const key = argv[i];
@@ -24,6 +25,7 @@ function parseArgs(argv) {
     else if (key === '--expect-served') args.expectServed = argv[++i];
     else if (key === '--expect-rollback') args.expectRollback = true;
     else if (key === '--cert') args.cert = argv[++i];
+    else if (key === '--patch-base') args.patchBase = argv[++i];
   }
   return args;
 }
@@ -100,6 +102,114 @@ async function verifyAsset(asset, label) {
   check(
     (response.headers.get('cache-control') || '').includes('immutable'),
     `${label} 使用 immutable 长缓存`,
+  );
+}
+
+/**
+ * 差分自检：模拟 expo-updates 的 asset 请求（A-IM + 当前 updateId），
+ * 命中时校验 226 / IM / Expo-Base-Update-ID / Vary / BSDIFF40 魔数。
+ * 服务端没有对应补丁时回退 200 完整包，只提示不计失败。
+ */
+async function verifyPatchAsset(asset, baseUpdateId, platform) {
+  const response = await fetch(asset.url, {
+    headers: {
+      'a-im': 'bsdiff',
+      'expo-current-update-id': String(baseUpdateId).toLowerCase(),
+      'expo-embedded-update-id': String(baseUpdateId).toLowerCase(),
+      'expo-platform': platform,
+      'expo-protocol-version': '1',
+      'accept-encoding': 'identity',
+    },
+  });
+  if (response.status === 200) {
+    console.log('  [INFO] 服务端未命中补丁，已回退完整包（检查是否发布过两个版本 / 注册内置包）');
+    return;
+  }
+  check(response.status === 226, '补丁响应为 226 IM Used', `HTTP ${response.status}`);
+  const im = response.headers.get('im') || '';
+  check(im.toLowerCase().includes('bsdiff'), '响应头 IM: bsdiff', im);
+  check(
+    (response.headers.get('expo-base-update-id') || '').toLowerCase() ===
+      String(baseUpdateId).toLowerCase(),
+    'Expo-Base-Update-ID 与请求一致',
+    response.headers.get('expo-base-update-id') || '',
+  );
+  check(
+    (response.headers.get('vary') || '').includes('a-im'),
+    '补丁响应声明 Vary: A-IM',
+  );
+  check(
+    !(response.headers.get('cache-control') || '').includes('immutable'),
+    '补丁响应不进 immutable 共享缓存',
+  );
+  check(!response.headers.get('content-encoding'), '补丁响应未叠加 gzip');
+  const buffer = Buffer.from(await response.arrayBuffer());
+  check(
+    buffer.length >= 32 && buffer.subarray(0, 8).toString('ascii') === 'BSDIFF40',
+    '补丁为 BSDIFF40 格式',
+    `size=${buffer.length}`,
+  );
+}
+
+/**
+ * 断点续传自检：HEAD 探测 + 两段 Range，拼接后用 manifest 的 asset.hash 校验，
+ * 并确认越界范围返回 416。强制 identity，避免压缩域偏移影响字节比对。
+ */
+async function verifyRange(asset, label) {
+  const identity = { 'accept-encoding': 'identity' };
+  const head = await fetch(asset.url, { method: 'HEAD', headers: identity });
+  check(
+    (head.headers.get('accept-ranges') || '').toLowerCase() === 'bytes',
+    `${label} 声明 Accept-Ranges: bytes`,
+    head.headers.get('accept-ranges') || '',
+  );
+  const size = Number(head.headers.get('content-length'));
+  check(Number.isSafeInteger(size) && size > 1, `${label} HEAD 返回未编码长度`, String(size));
+  if (!Number.isSafeInteger(size) || size <= 1) return;
+
+  const boundary = Math.floor(size / 2);
+  const first = await fetch(asset.url, {
+    headers: { ...identity, range: `bytes=0-${boundary - 1}` },
+  });
+  check(first.status === 206, `${label} 首段返回 206`, `HTTP ${first.status}`);
+  check(
+    first.headers.get('content-range') === `bytes 0-${boundary - 1}/${size}`,
+    `${label} 首段 Content-Range 正确`,
+    first.headers.get('content-range') || '',
+  );
+
+  const validator = head.headers.get('etag');
+  const second = await fetch(asset.url, {
+    headers: {
+      ...identity,
+      range: `bytes=${boundary}-`,
+      ...(validator ? { 'if-range': validator } : {}),
+    },
+  });
+  check(second.status === 206, `${label} 续传段返回 206`, `HTTP ${second.status}`);
+  check(
+    second.headers.get('content-range') === `bytes ${boundary}-${size - 1}/${size}`,
+    `${label} 续传段 Content-Range 正确`,
+    second.headers.get('content-range') || '',
+  );
+  check(!first.headers.get('content-encoding'), `${label} 分片未叠加 gzip`);
+
+  const joined = Buffer.concat([
+    Buffer.from(await first.arrayBuffer()),
+    Buffer.from(await second.arrayBuffer()),
+  ]);
+  check(joined.length === size, `${label} 分片拼接长度正确`, `${joined.length}/${size}`);
+  const hash = crypto.createHash('sha256').update(joined).digest('base64url');
+  check(hash === asset.hash, `${label} 分片拼接后 SHA-256 校验通过`);
+
+  const bad = await fetch(asset.url, {
+    headers: { ...identity, range: `bytes=${size}-` },
+  });
+  check(bad.status === 416, `${label} 越界范围返回 416`, `HTTP ${bad.status}`);
+  check(
+    bad.headers.get('content-range') === `bytes */${size}`,
+    `${label} 416 声明 Content-Range: bytes */size`,
+    bad.headers.get('content-range') || '',
   );
 }
 
@@ -209,6 +319,10 @@ async function main() {
   }
 
   await verifyAsset(manifest.launchAsset, 'launchAsset');
+  if (args.patchBase) {
+    await verifyPatchAsset(manifest.launchAsset, args.patchBase, args.platform);
+  }
+  await verifyRange(manifest.launchAsset, 'launchAsset');
   for (const [index, asset] of (manifest.assets || []).entries()) {
     await verifyAsset(asset, `assets[${index}]`);
   }

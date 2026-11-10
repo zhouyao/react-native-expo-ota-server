@@ -9,8 +9,24 @@ import {
 } from './release-store.mjs';
 import { readJson } from './lib.mjs';
 import { aggregateMetrics, normalizePlatform, recentEvents } from './metrics.mjs';
+import { patchStats, releaseLaunchHashes } from './patch-store.mjs';
 
 const EVENTS_LIMIT_MAX = 200;
+
+const EMPTY_PATCH = {
+  requests: 0,
+  hits: 0,
+  fallbacks: 0,
+  hitRate: 0,
+  patchBytes: 0,
+  fullBytes: 0,
+  savedBytes: 0,
+  savingRate: 0,
+  reasons: {},
+  byPlatform: {},
+  byChannel: {},
+  byDay: [],
+};
 
 const EMPTY_METRICS = {
   windowDays: 7,
@@ -27,6 +43,7 @@ const EMPTY_METRICS = {
   byStatus: {},
   byDay: [],
   versions: {},
+  patch: EMPTY_PATCH,
 };
 
 const EMPTY_CHANNEL_METRICS = {
@@ -146,6 +163,10 @@ export async function buildDashboardState(requested, query = {}) {
     channels.map((channel) => channel.updateId).filter(Boolean),
   );
 
+  const patches = rv
+    ? await patchStats(rv)
+    : { totalCount: 0, totalBytes: 0, byTargetHash: {}, byPlatform: {} };
+
   const releases = [];
   let total = 0;
   for (const id of (rv ? await listReleaseIds(rv) : [])) {
@@ -153,6 +174,15 @@ export async function buildDashboardState(requested, query = {}) {
     const meta = await readJson(path.join(dir, 'metadata.json'));
     const stats = await statsOf(dir);
     total += stats.size;
+    let patchCount = 0;
+    let patchBytes = 0;
+    for (const hash of releaseLaunchHashes(meta)) {
+      const entry = patches.byTargetHash[hash];
+      if (entry) {
+        patchCount += entry.count;
+        patchBytes += entry.bytes;
+      }
+    }
     releases.push({
       releaseId: id,
       updateId: meta?.id || null,
@@ -161,6 +191,8 @@ export async function buildDashboardState(requested, query = {}) {
       files: stats.files,
       size: stats.size,
       restoredFrom: meta?.restoredFrom || null,
+      patchCount,
+      patchBytes,
       currentChannels: currentBy.get(id) || [],
       previousChannels: previousBy.get(id) || [],
       // 各通道 current 的 updateId 集合：命中即同一个产物（不做内容 diff）
@@ -190,6 +222,8 @@ export async function buildDashboardState(requested, query = {}) {
       releases: releases.length,
       channels: channels.length,
       assetsBytes: total,
+      patchCount: patches.totalCount,
+      patchBytes: patches.totalBytes,
     },
   };
 }

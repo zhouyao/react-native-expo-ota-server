@@ -152,4 +152,18 @@ if (args.skipBuild) {
 console.log(`[3/3] 构建 Release 并安装到 ${args.device}`);
 run('npx', ['expo', 'run:ios', '--configuration', 'Release', '--no-bundler', '--device', args.device], env);
 
+// 注册本次构建内置的 bundle（自动扫描 DerivedData），让新装设备首次更新也能走差分。
+if (process.env.OTA_REGISTER_EMBEDDED !== '0') {
+  try {
+    run(process.execPath, [
+      path.join(ROOT, 'scripts/register-embedded.mjs'),
+      '--platform', 'ios',
+      '--channel', args.channel,
+      '--auto',
+    ], env);
+  } catch (error) {
+    console.warn(`[embedded] 内置包注册失败（不影响构建）: ${error.message}`);
+  }
+}
+
 console.log('\n完成。首次冷启动下载更新，第二次冷启动生效；页面 isEmbeddedLaunch 应为 false。');

@@ -119,10 +119,13 @@
   // ---------- 渲染：概览 ----------
   function renderStats() {
     var m = state.metrics || {};
+    var p = m.patch || {};
     var cards = [
       ['通道', esc(state.stats.channels), '当前 runtimeVersion 下的通道数'],
       ['历史发布', esc(state.stats.releases), '每次发布/提升/回滚/重发都新增一条不可变产物'],
       ['7 天 manifest 请求', esc(m.manifests), '指标窗口固定 7 天' + (view.platform ? '，已按平台 ' + view.platform + ' 筛选' : '')],
+      ['差分命中率', esc(p.hitRate || 0) + '%', '口径：7 天内带 A-IM 的 asset 请求中返回 226 补丁的占比，' + esc(p.hits || 0) + '/' + esc(p.requests || 0)],
+      ['节省流量', fmtBytes(p.savedBytes), '补丁相比 gzip 完整包累计节省的下载字节'],
       ['错误率', pct(m.errors, m.total) + '%', '口径：7 天内全部事件（manifest / asset / 客户端上报）中 status>=400 的占比，' + esc(m.errors) + '/' + esc(m.total)],
     ];
     $('#stats').innerHTML = cards.map(function (c) {
@@ -341,6 +344,48 @@
   }
 
   // ---------- 渲染：Metrics 明细 ----------
+  /** 指标页的增量差分小节：命中/回退、节省量、按平台与按通道。 */
+  function patchSection(m) {
+    var p = m.patch || {};
+    var byPlatform = p.byPlatform || {};
+    var platformRows = PLATFORMS.map(function (name) {
+      var v = byPlatform[name] || {};
+      return '<tr><td><b>' + esc(PLATFORM_LABEL[name] || name) + '</b></td>'
+        + '<td>' + esc(v.requests || 0) + '</td><td>' + esc(v.hits || 0) + '</td>'
+        + '<td>' + esc(v.fallbacks || 0) + '</td><td>' + esc(v.hitRate || 0) + '%</td>'
+        + '<td>' + esc(fmtBytes(v.savedBytes)) + '</td></tr>';
+    }).join('');
+    var byChannel = p.byChannel || {};
+    var channelRows = Object.keys(byChannel).sort(function (a, b) {
+      return (byChannel[b].requests || 0) - (byChannel[a].requests || 0);
+    }).map(function (name) {
+      var v = byChannel[name];
+      return '<tr><td><b>' + esc(name) + '</b></td><td>' + esc(v.requests || 0) + '</td>'
+        + '<td>' + esc(v.hits || 0) + '</td><td>' + esc(v.hitRate || 0) + '%</td>'
+        + '<td>' + esc(fmtBytes(v.savedBytes)) + '</td></tr>';
+    }).join('');
+    var reasons = p.reasons || {};
+    var reasonTags = Object.keys(reasons).sort(function (a, b) {
+      return reasons[b] - reasons[a];
+    }).map(function (reason) {
+      return '<span class="tag gray">' + esc(reason) + ' × ' + esc(reasons[reason]) + '</span>';
+    }).join('') || '<span class="empty">暂无</span>';
+
+    return '<h2 style="margin-top:16px">增量差分（最近 7 天）</h2>'
+      + '<div class="meta">请求 ' + esc(p.requests || 0) + ' · 命中 ' + esc(p.hits || 0)
+      + ' · 回退 ' + esc(p.fallbacks || 0) + ' · 命中率 ' + esc(p.hitRate || 0) + '%'
+      + ' · 补丁 ' + esc(fmtBytes(p.patchBytes)) + ' / 全量 ' + esc(fmtBytes(p.fullBytes))
+      + ' · 节省 ' + esc(fmtBytes(p.savedBytes)) + '（' + esc(p.savingRate || 0) + '%）</div>'
+      + '<div class="meta" style="margin:8px 0">回退原因：' + reasonTags + '</div>'
+      + '<div class="table-wrap"><table><thead><tr><th>平台</th><th>请求</th><th>命中</th><th>回退</th><th>命中率</th><th>节省</th></tr></thead><tbody>'
+      + (platformRows || '<tr><td colspan="6" class="empty">暂无数据</td></tr>') + '</tbody></table></div>'
+      + '<h2 style="margin-top:16px">差分按通道（受顶部筛选影响）</h2>'
+      + '<div class="table-wrap"><table><thead><tr><th>通道</th><th>请求</th><th>命中</th><th>命中率</th><th>节省</th></tr></thead><tbody>'
+      + (channelRows || '<tr><td colspan="5" class="empty">暂无数据</td></tr>') + '</tbody></table></div>'
+      + '<div class="meta" style="margin-top:8px">补丁库：' + esc((state.stats || {}).patchCount || 0)
+      + ' 个 / ' + esc(fmtBytes((state.stats || {}).patchBytes)) + '</div>';
+  }
+
   function renderMetricsDetail() {
     var m = state.metrics || {};
     var updateToRelease = {};
@@ -398,7 +443,8 @@
       + (channelRows || '<tr><td colspan="8" class="empty">暂无数据</td></tr>') + '</tbody></table></div>'
       + (versionRows
         ? '<h2 style="margin-top:16px">updateId 命中 Top 5</h2><div class="table-wrap"><table><thead><tr><th>updateId</th><th>releaseId</th><th>manifest 命中</th></tr></thead><tbody>' + versionRows + '</tbody></table></div>'
-        : '');
+        : '')
+      + patchSection(m);
   }
 
   // ---------- 渲染：Updates ----------
@@ -426,6 +472,8 @@
         + '<td class="mono" title="' + escAttr(r.updateId) + '">' + esc(fmtShort(r.updateId)) + '</td>'
         + '<td>' + esc((r.platforms || []).join(', ')) + '</td>'
         + '<td>' + esc(fmtBytes(r.size)) + '</td>'
+        + '<td title="以此版本为目标的补丁数 / 体积">' + esc(r.patchCount || 0)
+        + ' / ' + esc(fmtBytes(r.patchBytes)) + '</td>'
         + '<td>' + tags + '</td></tr>';
     }).join('');
 
@@ -436,8 +484,8 @@
         return '<option value="' + p + '"' + (platform === p ? ' selected' : '') + '>' + esc(PLATFORM_LABEL[p] || p) + '</option>';
       }).join('') + '</select>'
       + '<span class="meta">共 ' + list.length + ' 条</span></div>'
-      + '<div class="table-wrap"><table><thead><tr><th>时间</th><th>releaseId</th><th>updateId</th><th>平台</th><th>大小</th><th>状态</th></tr></thead><tbody>'
-      + (rows || '<tr><td colspan="6" class="empty">没有匹配的版本</td></tr>') + '</tbody></table></div>'
+      + '<div class="table-wrap"><table><thead><tr><th>时间</th><th>releaseId</th><th>updateId</th><th>平台</th><th>大小</th><th>补丁</th><th>状态</th></tr></thead><tbody>'
+      + (rows || '<tr><td colspan="7" class="empty">没有匹配的版本</td></tr>') + '</tbody></table></div>'
       + '<div class="pager">'
       + '<button type="button" id="upPrev"' + (page <= 1 ? ' disabled' : '') + '>上一页</button>'
       + '<span>' + page + ' / ' + pages + '</span>'

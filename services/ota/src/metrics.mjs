@@ -93,6 +93,39 @@ const dayKey = (iso) => {
     : 'unknown';
 };
 
+/** 差分补丁的独立统计口径：不并入 total / manifests / assets / clientEvents。 */
+function emptyPatchStats() {
+  return {
+    requests: 0,
+    hits: 0,
+    fallbacks: 0,
+    patchBytes: 0,
+    fullBytes: 0,
+    savedBytes: 0,
+  };
+}
+
+function bumpPatch(stats, event) {
+  stats.requests += 1;
+  if (event.hit) {
+    stats.hits += 1;
+    stats.patchBytes += Number(event.patchSize) || 0;
+    stats.fullBytes += Number(event.fullSize) || 0;
+    stats.savedBytes += Number(event.savedBytes) || 0;
+  } else {
+    stats.fallbacks += 1;
+  }
+  return stats;
+}
+
+function patchRates(stats) {
+  return {
+    ...stats,
+    hitRate: stats.requests ? Math.round((stats.hits / stats.requests) * 100) : 0,
+    savingRate: stats.fullBytes ? Math.round((stats.savedBytes / stats.fullBytes) * 100) : 0,
+  };
+}
+
 function emptyPlatformGroup() {
   return {
     total: 0,
@@ -139,6 +172,16 @@ export async function aggregateMetrics(
   const platformUids = Object.fromEntries(
     PLATFORM_GROUPS.map((name) => [name, new Set()]),
   );
+  // patch 单独聚合：byPlatform / reasons 始终全量，汇总与 byChannel / byDay 跟随平台筛选。
+  const patch = {
+    ...emptyPatchStats(),
+    reasons: {},
+    byPlatform: Object.fromEntries(
+      PLATFORM_GROUPS.map((name) => [name, emptyPatchStats()]),
+    ),
+    byChannel: {},
+    byDay: {},
+  };
   let manifests = 0;
   let assets = 0;
   let clientEvents = 0;
@@ -181,6 +224,25 @@ export async function aggregateMetrics(
   const platformChannelUids = new Map();
 
   for (const event of events) {
+    // 补丁事件走独立口径，避免改变既有 total / 错误率 / 客户端上报等统计。
+    if (event.type === 'asset-patch') {
+      const patchPlatform = platformKey(event);
+      bumpPatch(patch.byPlatform[patchPlatform], event);
+      if (!event.hit) {
+        const reason = event.reason || 'unknown';
+        patch.reasons[reason] = (patch.reasons[reason] || 0) + 1;
+      }
+      if (filter && patchPlatform !== filter) continue;
+      bumpPatch(patch, event);
+      const patchChannel = event.channel || '-';
+      patch.byChannel[patchChannel] ||= emptyPatchStats();
+      bumpPatch(patch.byChannel[patchChannel], event);
+      const patchDay = dayKey(event.at);
+      patch.byDay[patchDay] ||= emptyPatchStats();
+      bumpPatch(patch.byDay[patchDay], event);
+      continue;
+    }
+
     const key = platformKey(event);
     const group = byPlatform[key];
     const status = Number(event.status) || 0;
@@ -291,6 +353,21 @@ export async function aggregateMetrics(
     byStatus,
     byDay: dayEntries(byDay),
     versions,
+    patch: {
+      ...patchRates(patch),
+      reasons: patch.reasons,
+      byPlatform: Object.fromEntries(
+        PLATFORM_GROUPS.map((name) => [name, patchRates(patch.byPlatform[name])]),
+      ),
+      byChannel: Object.fromEntries(
+        Object.entries(patch.byChannel).map(([name, stats]) => [name, patchRates(stats)]),
+      ),
+      byDay: dayEntries(
+        Object.fromEntries(
+          Object.entries(patch.byDay).map(([day, stats]) => [day, patchRates(stats)]),
+        ),
+      ),
+    },
   };
 }
 

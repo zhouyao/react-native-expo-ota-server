@@ -187,6 +187,49 @@ test('指标页「按平台」只列 ios / android，未标记事件降级为脚
   assert.ok(html.includes('未计入上表'), '应说明未计入平台对比');
 });
 
+test('差分数据同时进入概览卡、指标页与版本页', () => {
+  const state = {
+    metrics: {
+      byDay: [],
+      byServed: {},
+      byPlatform: { ios: {}, android: {}, unknown: {} },
+      patch: {
+        requests: 10, hits: 7, fallbacks: 3, hitRate: 70,
+        patchBytes: 700, fullBytes: 10000, savedBytes: 9300, savingRate: 93,
+        reasons: { 'base-missing': 3 },
+        byPlatform: {
+          ios: { requests: 6, hits: 5, fallbacks: 1, hitRate: 83, savedBytes: 5000 },
+          android: { requests: 4, hits: 2, fallbacks: 2, hitRate: 50, savedBytes: 4300 },
+        },
+        byChannel: { beta: { requests: 10, hits: 7, hitRate: 70, savedBytes: 9300 } },
+      },
+    },
+    stats: { releases: 1, channels: 1, assetsBytes: 1024, patchCount: 4, patchBytes: 2048 },
+    releases: [{
+      releaseId: '1000', updateId: 'abc', createdAt: '2026-01-01T00:00:00.000Z',
+      platforms: ['ios'], files: 1, size: 1024,
+      currentChannels: ['beta'], previousChannels: [], sameAsCurrent: true,
+      restoredFrom: null, patchCount: 2, patchBytes: 512,
+    }],
+  };
+  const overview = runDashboard([], { hash: '#overview', state }).elements;
+  const statsHtml = overview.get('#stats').innerHTML;
+  assert.ok(statsHtml.includes('差分命中率'));
+  assert.ok(statsHtml.includes('70%'));
+  assert.ok(statsHtml.includes('节省流量'));
+
+  const metrics = runDashboard([], { hash: '#metrics', state }).elements;
+  const metricsHtml = metrics.get('#metrics').innerHTML;
+  assert.ok(metricsHtml.includes('增量差分'));
+  assert.ok(metricsHtml.includes('base-missing'));
+  assert.ok(metricsHtml.includes('补丁库：4'));
+
+  const updates = runDashboard([], { hash: '#updates', state }).elements;
+  const updatesHtml = updates.get('#updates').innerHTML;
+  assert.ok(updatesHtml.includes('<th>补丁</th>'));
+  assert.ok(updatesHtml.includes('2 / '));
+});
+
 test('移除全局搜索后初始化不再依赖 #q', () => {
   const { calls } = runDashboard(['#q']);
   assert.ok(!calls.some((call) => call.selector === '#q'));

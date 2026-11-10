@@ -438,6 +438,23 @@ const runArgs = ['expo', 'run:android', '--variant', args.variant, '--no-bundler
 if (args.device) runArgs.push('--device', serial);
 run('npx', runArgs, env);
 
+// 注册本次构建内置的 bundle，让全新安装的设备首次 OTA 也能命中 bsdiff 补丁。
+// 找不到构建产物或 bsdiff 时只告警，绝不阻断构建。
+if (process.env.OTA_REGISTER_EMBEDDED !== '0') {
+  try {
+    run(process.execPath, [
+      path.join(ROOT, 'scripts/register-embedded.mjs'),
+      '--platform', 'android',
+      '--channel', args.channel,
+      '--rv', String(expect.runtimeVersion),
+      '--variant', args.variant,
+      '--auto',
+    ], env);
+  } catch (error) {
+    console.warn(`[embedded] 内置包注册失败（不影响构建）: ${error.message}`);
+  }
+}
+
 console.log(`
 完成。验证 OTA：
   adb -s ${serial} shell am force-stop ${expoConfig.android.package}

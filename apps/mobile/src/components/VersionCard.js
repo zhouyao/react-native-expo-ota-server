@@ -13,10 +13,11 @@ function Field({ label, value, mono }) {
   );
 }
 
-export default function VersionCard({ releaseId, updateId, createdAt }) {
+export default function VersionCard({ releaseId, updateId, createdAt, serverEndpoint }) {
   return (
     <View style={styles.card}>
       <Text style={styles.title}>当前版本</Text>
+      <Field label="OTA 服务" value={serverEndpoint} mono />
       <Field label="releaseId" value={releaseId} mono />
       <Field label="updateId" value={updateId ? String(updateId).slice(0, 8) : '-'} mono />
       <Field label="发布时间" value={createdAt} />

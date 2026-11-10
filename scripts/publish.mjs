@@ -29,6 +29,7 @@ import {
   setRollback,
 } from '../services/ota/src/release-store.mjs';
 import { withLock } from '../services/ota/src/locks.mjs';
+import { generatePatchesForRelease } from './patches.mjs';
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(scriptsDir, '..');
@@ -53,10 +54,13 @@ function parseArgs(argv) {
     requestId: null,
     preflight: true,
     autoRollback: false,
+    patches: true,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const key = argv[i];
-    if (key === '--rollback') {
+    if (key === '--no-patches') {
+      args.patches = false;
+    } else if (key === '--rollback') {
       args.rollback = true;
     } else if (key === '--channel') {
       args.channel = normalizeChannel(argv[++i]);
@@ -102,6 +106,7 @@ function parseArgs(argv) {
   --via <source>          操作来源（cli / dashboard / ci）
   --request-id <id>       幂等键，重复提交不会重复发布
   --no-preflight          发布后跳过自检
+  --no-patches            跳过差分补丁生成（仅下发完整包）
   --auto-rollback-on-fail 自检失败时自动回滚到 previous`);
       process.exit(0);
     }
@@ -283,6 +288,26 @@ function serviceBaseUrl() {
   return `http://localhost:${process.env.PORT || 3000}`;
 }
 
+/**
+ * 发布期为新版本预生成 bsdiff 补丁。
+ * 缺 bsdiff / 生成失败都只降级为「仅全量」，绝不阻断发布。
+ */
+async function maybeGeneratePatches(runtimeVersion, releaseId, args) {
+  if (!args.patches) return;
+  try {
+    const result = await generatePatchesForRelease(runtimeVersion, releaseId, {
+      log: console.log,
+    });
+    console.log(
+      `[publish] 差分补丁: 新增 ${result.generated}，跳过 ${result.skipped}，` +
+        `收益不足 ${result.notBeneficial}，失败 ${result.failed}` +
+        (result.unavailable ? '（bsdiff 不可用，客户端将下载完整包）' : ''),
+    );
+  } catch (error) {
+    console.warn(`[publish] 补丁生成失败（不影响本次发布）: ${error.message}`);
+  }
+}
+
 /** 发布后自检：拉一次真实 manifest，校验协议/通道/资源/签名。 */
 function runPreflight(runtimeVersion, args) {
   const script = path.join(ROOT, 'scripts', 'preflight.mjs');
@@ -459,6 +484,7 @@ async function main() {
       restoredFrom: args.release,
       metadata: { ...(sourceMeta.metadata || {}), channel: args.channel },
     });
+    await maybeGeneratePatches(runtimeVersion, newReleaseId, args);
     await withLock(
       `${runtimeVersion}:${args.channel}`,
       channelLockFile(runtimeVersion, args.channel),
@@ -544,6 +570,8 @@ async function main() {
   } catch (error) {
     console.warn(`[publish] 写入 expoConfig.json 失败（不影响更新）: ${error.message}`);
   }
+
+  await maybeGeneratePatches(runtimeVersion, releaseId, args);
 
   const channel = await withLock(
     `${runtimeVersion}:${args.channel}`,

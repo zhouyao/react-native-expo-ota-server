@@ -2,6 +2,7 @@ import http from 'node:http';
 import https from 'node:https';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   ADMIN_ENABLED,
   OTA_ENV,
@@ -18,12 +19,43 @@ import { aggregateMetrics, recordEvent } from './metrics.mjs';
 import { buildDashboardState } from './dashboard.mjs';
 import { renderDashboardHtml } from './dashboard-view.mjs';
 
-function send(res, { status = 200, headers = {}, body }) {
-  const payload = Buffer.isBuffer(body) ? body : Buffer.from(String(body));
-  res.writeHead(status, {
-    'content-length': String(payload.length),
-    ...headers,
-  });
+/**
+ * 统一响应出口。body 可以是 Buffer / 字符串 / 可读流（206 分片）；
+ * head=true 时只发与 GET 相同的头，不创建或读取响应体。
+ */
+function send(res, { status = 200, headers = {}, body }, options = {}) {
+  const head = options.head === true;
+  const isStream = Boolean(body && typeof body.pipe === 'function');
+  const payload =
+    body == null || isStream
+      ? null
+      : Buffer.isBuffer(body)
+        ? body
+        : Buffer.from(String(body));
+  const bodyless = head || body == null || status === 304 || status === 204;
+
+  if (isStream && bodyless) body.destroy();
+
+  const finalHeaders = { ...headers };
+  if (status === 304 || status === 204) {
+    delete finalHeaders['content-length'];
+  } else if (!('content-length' in finalHeaders) && payload) {
+    finalHeaders['content-length'] = String(payload.length);
+  }
+
+  res.writeHead(status, finalHeaders);
+  if (bodyless) {
+    res.end();
+    return;
+  }
+  if (isStream) {
+    body.on('error', (error) => {
+      console.error('[ota] 资产流读取失败:', error);
+      res.destroy();
+    });
+    body.pipe(res);
+    return;
+  }
   res.end(payload);
 }
 
@@ -99,7 +131,7 @@ function dashboardQuery(url) {
   };
 }
 
-async function handle(req, res) {
+export async function handle(req, res) {
   const started = Date.now();
   const secure = Boolean(req.socket.encrypted);
   let url;
@@ -379,7 +411,8 @@ async function handle(req, res) {
     }
 
     if (url.pathname === '/api/assets') {
-      if (req.method !== 'GET') {
+      // HEAD 供客户端探测文件长度与 Accept-Ranges，再决定是否需要续传。
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
         return send(res, { status: 405, body: 'method not allowed' });
       }
       const response = await serveAsset({
@@ -387,7 +420,27 @@ async function handle(req, res) {
         releaseId: url.searchParams.get('release'),
         file: url.searchParams.get('file'),
         acceptEncoding: req.headers['accept-encoding'] || '',
+        headers: req.headers,
+        method: req.method,
       });
+      // 差分命中/回退单独成事件，不混进普通 asset 指标口径。
+      if (response.patch) {
+        recordEvent(url.searchParams.get('rv') || '', {
+          type: 'asset-patch',
+          channel: req.headers['expo-channel-name'] || (channel === '-' ? null : channel),
+          status: response.status,
+          platform: req.headers['expo-platform'] || null,
+          releaseId: url.searchParams.get('release'),
+          file: url.searchParams.get('file'),
+          ...response.patch,
+        });
+        if (response.patch.hit) {
+          console.log(
+            `[ota] asset 差分命中: ${response.patch.platform} ${response.patch.patchSize}B ` +
+              `-> 省 ${response.patch.savedBytes}B`,
+          );
+        }
+      }
       if (response.status >= 400) {
         // 资产请求由 expo-updates 原生层发起，不带 expo-platform，无法归因到设备平台；
         // 显式写 null，聚合时归入「未标记」兜底分组而不是某种设备平台。
@@ -405,7 +458,13 @@ async function handle(req, res) {
           `[ota] asset 压缩命中: ${response.encoding} ${url.searchParams.get('file')} -> ${response.headers['content-length']}B`,
         );
       }
-      return send(res, response);
+      if (response.range) {
+        console.log(
+          `[ota] asset 断点续传: ${url.searchParams.get('file')} -> ` +
+            `${response.range.start}-${response.range.end}/${response.range.size}`,
+        );
+      }
+      return send(res, response, { head: req.method === 'HEAD' });
     }
 
     return send(res, { status: 404, body: 'not found' });
@@ -467,7 +526,13 @@ async function main() {
   });
 }
 
-main().catch((error) => {
-  console.error(`[ota] 启动失败: ${error.message}`);
-  process.exitCode = 1;
-});
+// 仅当作为入口脚本执行时监听端口；被测试 import 时只导出 handle，不启动服务。
+const isDirectRun =
+  process.argv[1] &&
+  fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (isDirectRun) {
+  main().catch((error) => {
+    console.error(`[ota] 启动失败: ${error.message}`);
+    process.exitCode = 1;
+  });
+}

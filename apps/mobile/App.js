@@ -27,6 +27,7 @@ import ErrorBoundary from './src/components/ErrorBoundary';
 import { getJson, getRecentRequests } from './src/api';
 import { logger, reportError } from './src/logger';
 import { reportStartupOnce, sinceBundleStart } from './src/perf';
+import { serverConfig } from './src/server-config';
 import { colors, spacing } from './src/theme';
 
 const APP_ENV = process.env.EXPO_PUBLIC_APP_ENV || 'development';
@@ -173,6 +174,8 @@ function Console() {
     void loadChannels();
   }, [loadChannels]);
 
+  // 服务器地址/端口：构建期配置 + 实际连接 origin，首屏与调试面板都展示。
+  const server = serverConfig();
   const metadata = Updates.manifest?.metadata || {};
   // 运行中版本所属通道（manifest metadata），拿不到时退回请求通道。
   const channel = metadata.channel || activeChannel || BUILD_CHANNEL || '未配置';
@@ -205,7 +208,7 @@ function Console() {
     : isUpdateAvailable
       ? '有可用更新'
       : '已是最新';
-  const debugSummary = `${runningVersionLabel}${
+  const debugSummary = `${server.endpoint} · ${runningVersionLabel}${
     activeChannel && activeChannel !== buildChannel ? ` → ${activeChannel}` : ''
   }`;
 
@@ -365,6 +368,7 @@ function Console() {
         releaseId={releaseId}
         updateId={Updates.updateId}
         createdAt={formatTime(Updates.createdAt)}
+        serverEndpoint={server.endpoint}
       />
 
       <UpdateFlow
@@ -389,6 +393,22 @@ function Console() {
           <DebugRow label="请求通道" value={requestLabel} />
           <DebugRow label="下发通道" value={servedLabel} />
           <DebugRow label="更新状态" value={updateState} />
+        </DebugSection>
+
+        <DebugSection
+          title="OTA 服务地址"
+          hint="构建期地址来自打包时的 updates.url；已下载更新后以服务端下发的 origin 为准。"
+        >
+          <DebugRow label="服务器地址" value={server.active?.host || '-'} />
+          <DebugRow label="端口" value={server.active?.port || '-'} />
+          <DebugRow label="请求地址" value={server.requestUrl || '-'} multiline />
+          <DebugRow label="地址来源" value={server.source} />
+          <DebugRow label="构建期地址" value={server.build?.url || '-'} multiline />
+          <DebugRow
+            label="地址一致性"
+            value={server.mismatched ? '构建期与实际不同' : '一致'}
+            warn={server.mismatched}
+          />
         </DebugSection>
 
         <DebugSection title="环境与版本">
