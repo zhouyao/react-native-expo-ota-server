@@ -314,6 +314,8 @@ export async function handle(req, res) {
           secure,
           env: OTA_ENV,
           publicBaseUrl: PUBLIC_BASE_URL,
+          // 重启后这个时间会更新；控制台报「未知操作」时可据此判断是否加载了新代码。
+          startedAt: STARTED_AT,
           // 只暴露「有没有在跑、上次跑成什么样」，不回显被回收的版本清单。
           gc: {
             enabled: gcState.enabled,
@@ -530,6 +532,9 @@ const gcState = {
   lastRunAt: null,
   lastError: null,
 };
+
+/** 进程启动时间：控制台新功能报「未知操作」时，用它确认服务是不是旧进程。 */
+const STARTED_AT = new Date().toISOString();
 
 /** 遍历所有 runtimeVersion 跑一次规划；apply 模式下才真正删除。 */
 async function runGcOnce() {

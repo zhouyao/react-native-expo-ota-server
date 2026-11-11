@@ -784,7 +784,7 @@ npm test
 | Android 安装失败 `INSTALL_FAILED_USER_RESTRICTED` | 在开发者选项中允许 USB 安装 |
 | iOS 提示未信任开发者 | 在系统设置中信任开发者证书后重新启动 App |
 | 控制台写操作返回 403 | 服务端未配置管理令牌、浏览器令牌无效，或该令牌缺少对应权限位（止血 / 恢复需 `stop-loss`，回收需 `gc`） |
-| 控制台提示「未知操作: xxx」 | 运行中的服务是旧进程，重启 `npm run ota:start` 加载新代码（HTML/JS 热加载，后端模块需重启） |
+| 控制台提示「未知操作: xxx」 | 运行中的服务是旧进程，重启 `npm run ota:start` 加载新代码（HTML/JS 热加载，后端模块需重启）；用 `curl /healthz` 看 `startedAt` 确认进程启动时间 |
 | 止损一直「样本不足」 | 检查 cohort 是否有 manifest / launch 上报、`MIN_SAMPLES` 与窗口是否合适、通道是否有真实设备流量 |
 | 止血后设备没回退 | `halt` 只挡住新设备，需重发布上一版或执行 `ota:rollback` 才能真正回退 |
 | Webhook 收不到消息 | 是否已保存、monitor 下是否超阈值、是否在告警冷却期、机器人地址与平台格式是否匹配 |

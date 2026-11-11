@@ -401,7 +401,12 @@ export async function performAdminAction(input, context = {}) {
         `，白名单 ${restored.whitelist} 个` +
         (restored.byPlatform ? `，平台覆盖 ${describeByPlatform(restored.byPlatform)}` : '');
     } else {
-      throw new Error(`未知操作: ${String(input.action || '(空)')}`);
+      // 控制台前端是热加载的、后端模块不是，因此「页面有新按钮但服务是旧进程」很常见。
+      // 这里把排查方向直接写进报错，避免只看到一句「未知操作」。
+      throw new Error(
+        `未知操作: ${String(input.action || '(空)')}。` +
+          '若该功能是刚新增的，说明运行中的服务仍是旧进程，请重启 npm run ota:start 加载新代码',
+      );
     }
 
     const result = { message, operator, duplicated: false };
