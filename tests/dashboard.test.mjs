@@ -756,3 +756,28 @@ test('立即评估会把服务端 output 显示在提示里', async () => {
     '应展示服务端返回的评估结果',
   );
 });
+
+test('版本页：受保护版本不能回收，并提供回收预览入口', () => {
+  const now = new Date().toISOString();
+  const releases = [
+    { releaseId: '1111', updateId: 'u-now', createdAt: now, platforms: ['ios'], currentChannels: ['production'], previousChannels: [], size: 1, patchCount: 0, patchBytes: 0 },
+    { releaseId: '2222', updateId: 'u-old', createdAt: now, platforms: ['ios'], currentChannels: [], previousChannels: [], size: 1, patchCount: 0, patchBytes: 0 },
+  ];
+
+  const enabled = runDashboard([], {
+    hash: '#updates',
+    state: { adminEnabled: true, releases },
+  });
+  const html = enabled.elements.get('#updates').innerHTML;
+  assert.ok(html.includes('id="upGcPreview"'), '应提供回收预览入口');
+  assert.ok(html.includes('data-act="gc-release"'), '每行应有回收按钮');
+
+  const pinned = html.slice(html.indexOf('data-release="1111"'), html.indexOf('data-release="1111"') + 60);
+  assert.ok(pinned.includes('disabled'), 'current 版本的回收按钮应禁用');
+  const free = html.slice(html.indexOf('data-release="2222"'), html.indexOf('data-release="2222"') + 60);
+  assert.ok(!free.includes('disabled'), '普通历史版本可以回收');
+
+  const disabled = runDashboard([], { hash: '#updates', state: { releases } });
+  const roHtml = disabled.elements.get('#updates').innerHTML;
+  assert.ok(!roHtml.includes('id="upGcPreview"'), '只读模式不显示回收预览');
+});

@@ -234,7 +234,7 @@
     var p = m.patch || {};
     var cards = [
       ['通道', esc(state.stats.channels), '当前 runtimeVersion 下的通道数'],
-      ['历史发布', esc(state.stats.releases), '每次发布/提升/回滚/重发都新增一条不可变产物'],
+      ['历史发布', esc(state.stats.releases), '每次发布/提升/回滚/重发都新增一条不可变产物；实际磁盘占用 ' + fmtBytes(state.stats.diskBytes) + '（提升/重发复用的资产按 inode 去重）'],
       ['7 天 manifest 请求', esc(m.manifests), '指标窗口固定 7 天' + (view.platform ? '，已按平台 ' + view.platform + ' 筛选' : '')],
       ['差分命中率', esc(p.hitRate || 0) + '%', '口径：7 天内带 A-IM 的 asset 请求中返回 226 补丁的占比，' + esc(p.hits || 0) + '/' + esc(p.requests || 0)],
       ['节省流量', fmtBytes(p.savedBytes), '补丁相比 gzip 完整包累计节省的下载字节'],
@@ -735,6 +735,12 @@
       if (r.restoredFrom) tags += '<span class="tag gray">源自 ' + esc(r.restoredFrom) + '</span>';
       if (!tags) tags = '<span class="tag gray">历史</span>';
       var runInfo = runInfoFor(r);
+      // current / previous 版本受服务端保护，前端只做提示；真正裁决在 gc.mjs 的保护集。
+      var pinned = r.currentChannels.length || r.previousChannels.length;
+      var gcDisabled = !state.adminEnabled || pinned;
+      var gcTitle = pinned
+        ? 'current / previous 版本受保护，不能回收'
+        : (!state.adminEnabled ? '未配置管理令牌' : '回收该版本目录，不可恢复');
       return '<tr><td>' + esc(fmtTime(r.createdAt)) + '</td>'
         + '<td class="mono">' + esc(r.releaseId) + ' <button type="button" class="mini" data-copy="' + escAttr(r.releaseId) + '">复制</button></td>'
         + '<td class="mono" title="' + escAttr(r.updateId) + '">' + esc(fmtShort(r.updateId)) + '</td>'
@@ -743,7 +749,10 @@
         + '<td title="以此版本为目标的补丁数 / 体积">' + esc(r.patchCount || 0)
         + ' / ' + esc(fmtBytes(r.patchBytes)) + '</td>'
         + '<td>' + renderRunningCell(runInfo) + '</td>'
-        + '<td>' + tags + '</td></tr>';
+        + '<td>' + tags + '</td>'
+        + '<td><button type="button" class="mini" data-act="gc-release" data-release="' + escAttr(r.releaseId) + '"'
+        + (gcDisabled ? ' disabled' : '') + ' title="' + escAttr(gcTitle) + '">回收</button></td>'
+        + '</tr>';
     }).join('');
 
     var channelOptions = ['<option value="">全部通道</option>'].concat(
@@ -779,9 +788,10 @@
       + '<select id="upRun">' + runOptions + '</select>'
       + '<input id="upQuery" type="search" placeholder="搜索 releaseId / updateId / 通道（空格分隔多关键词）" value="' + escAttr(query) + '">'
       + '<button type="button" id="upClear"' + (filtering ? '' : ' disabled') + '>重置</button>'
+      + (state.adminEnabled ? '<button type="button" id="upGcPreview" title="按保留策略预览将被回收的版本（不删除）">回收预览</button>' : '')
       + '<span class="meta">' + countText + '</span></div>'
-      + '<div class="table-wrap"><table><thead><tr><th>时间</th><th>releaseId</th><th>updateId</th><th>平台</th><th>大小</th><th>补丁</th><th>实际运行</th><th>状态</th></tr></thead><tbody>'
-      + (rows || '<tr><td colspan="8" class="empty">没有匹配的版本</td></tr>') + '</tbody></table></div>'
+      + '<div class="table-wrap"><table><thead><tr><th>时间</th><th>releaseId</th><th>updateId</th><th>平台</th><th>大小</th><th>补丁</th><th>实际运行</th><th>状态</th><th>操作</th></tr></thead><tbody>'
+      + (rows || '<tr><td colspan="9" class="empty">没有匹配的版本</td></tr>') + '</tbody></table></div>'
       + '<div class="pager">'
       + '<button type="button" id="upPrev"' + (page <= 1 ? ' disabled' : '') + '>上一页</button>'
       + '<span>' + page + ' / ' + pages + '</span>'
@@ -800,7 +810,7 @@
     }
 
     $('#updatesHint').textContent =
-      '共 ' + total + ' 条历史版本；支持按 releaseId / updateId / 运行通道关键字搜索，并可按通道与运行状态（current / previous / 其他）筛选；「实际运行」来自客户端最近一次上报';
+      '共 ' + total + ' 条历史版本；支持按 releaseId / updateId / 运行通道关键字搜索，并可按通道与运行状态（current / previous / 其他）筛选；「实际运行」来自客户端最近一次上报；回收只对既非 current 也非 previous、且不在保留期内的版本生效';
   }
 
   // ---------- 渲染：Events ----------
@@ -1234,6 +1244,28 @@
         view.updates.platform = '';
         view.updates.page = 1;
         renderUpdates({ keepFocus: true });
+      }
+      // 回收预览：服务端按保护集算出保留 / 待删清单，不删除任何文件。
+      if (e.target.id === 'upGcPreview') {
+        postAction({
+          action: 'gc-releases',
+          runtimeVersion: state.runtimeVersion,
+          apply: false,
+        }, null, e.target);
+        return;
+      }
+      // 测试桩的 target 不一定实现 closest，这里做能力检测，行为与真实浏览器一致。
+      var gcBtn = e.target && e.target.closest
+        ? e.target.closest('button[data-act="gc-release"]')
+        : null;
+      if (gcBtn) {
+        var releaseId = gcBtn.dataset.release;
+        postAction({
+          action: 'gc-releases',
+          runtimeVersion: state.runtimeVersion,
+          apply: true,
+          releaseIds: [releaseId],
+        }, '确认回收版本 ' + releaseId + '？目录会被删除且不可恢复；仍持有该版本 manifest 的设备将无法下载资产。', gcBtn);
       }
     });
 

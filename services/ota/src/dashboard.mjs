@@ -3,7 +3,6 @@ import path from 'node:path';
 import {
   ADMIN_ENABLED,
   PUBLIC_BASE_URL,
-  UPDATES_DIR,
   stopLossConfig,
   webhookOrigin,
 } from './config.mjs';
@@ -12,6 +11,7 @@ import {
   listReleaseIds,
   readChannel,
   releaseDir,
+  runtimeVersions,
 } from './release-store.mjs';
 import { readJson } from './lib.mjs';
 import { aggregateMetrics, normalizePlatform, recentEvents } from './metrics.mjs';
@@ -108,34 +108,36 @@ function pickEventQuery(query = {}) {
   };
 }
 
-async function statsOf(dir) {
+/**
+ * 统计一个 release 的体积。
+ *
+ * `size` 是逻辑体积（各文件大小之和），也是这个版本实际下发的字节量；
+ * `disk` 只统计首次见到的 inode：提升 / 重发用硬链接复用资产，
+ * 不去重会把同一份字节算很多遍，让「磁盘占用」严重虚高。
+ */
+async function statsOf(dir, seenInodes = new Set()) {
   let size = 0;
+  let disk = 0;
   let files = 0;
   for (const sub of ['bundles', 'assets']) {
     try {
       const entries = await fsp.readdir(path.join(dir, sub), { withFileTypes: true });
       for (const entry of entries) {
         if (!entry.isFile()) continue;
-        size += (await fsp.stat(path.join(dir, sub, entry.name))).size;
+        const stat = await fsp.stat(path.join(dir, sub, entry.name));
+        size += stat.size;
         files += 1;
+        const inode = `${stat.dev}:${stat.ino}`;
+        if (!seenInodes.has(inode)) {
+          seenInodes.add(inode);
+          disk += stat.size;
+        }
       }
     } catch {
       // 没有 assets 目录属于正常情况
     }
   }
-  return { size, files };
-}
-
-async function runtimeVersions() {
-  try {
-    const entries = await fsp.readdir(UPDATES_DIR, { withFileTypes: true });
-    return entries
-      .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
-      .map((entry) => entry.name)
-      .sort();
-  } catch {
-    return [];
-  }
+  return { size, disk, files };
 }
 
 /**
@@ -208,11 +210,15 @@ export async function buildDashboardState(requested, query = {}) {
 
   const releases = [];
   let total = 0;
+  let diskTotal = 0;
+  // 跨 release 共享同一个 Set：硬链接复用的资产只算一次真实磁盘占用。
+  const seenInodes = new Set();
   for (const id of (rv ? await listReleaseIds(rv) : [])) {
     const dir = releaseDir(rv, id);
     const meta = await readJson(path.join(dir, 'metadata.json'));
-    const stats = await statsOf(dir);
+    const stats = await statsOf(dir, seenInodes);
     total += stats.size;
+    diskTotal += stats.disk;
     let patchCount = 0;
     let patchBytes = 0;
     for (const hash of releaseLaunchHashes(meta)) {
@@ -270,7 +276,10 @@ export async function buildDashboardState(requested, query = {}) {
     stats: {
       releases: releases.length,
       channels: channels.length,
+      // 逻辑体积：所有版本下发的字节之和（硬链接复用的会重复计入）。
       assetsBytes: total,
+      // 真实磁盘占用：按 inode 去重，提升 / 重发复用的资产只算一次。
+      diskBytes: diskTotal,
       patchCount: patches.totalCount,
       patchBytes: patches.totalBytes,
     },

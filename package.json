@@ -37,6 +37,7 @@
     "ota:embedded": "node scripts/register-embedded.mjs",
     "ota:patch:rebuild": "node scripts/patches.mjs rebuild",
     "ota:patch:verify": "node scripts/patches.mjs verify",
+    "ota:gc": "node scripts/gc.mjs",
     "mobile:start": "npm --prefix apps/mobile run start",
     "mobile:export": "npm --prefix apps/mobile run export",
     "mobile:android": "npm --prefix apps/mobile run android",

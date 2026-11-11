@@ -31,6 +31,7 @@ Self-hosted [Expo Updates v1](https://docs.expo.dev/technical-specs/expo-updates
 - [实现细节](#实现细节)
   - [增量差分更新](#增量差分更新)
   - [资产断点续传](#资产断点续传)
+  - [数据保留与 GC](#数据保留与-gc)
   - [代码签名](#代码签名)
 - [参考](#参考)
   - [API](#api)
@@ -55,7 +56,8 @@ Self-hosted [Expo Updates v1](https://docs.expo.dev/technical-specs/expo-updates
 | 版本管理 | current / previous 指针、发布、提升、回滚、重新发布 |
 | 完整性 | manifest RSA-SHA256 签名，客户端内置公钥证书强校验 |
 | 可观测性 | 请求与客户端事件落盘，提供指标 API 和 Web 控制台 |
-| 运维安全 | 管理令牌（支持按 `release` / `rollout` / `stop-loss` 权限位分权）、通道锁、请求幂等、审计日志、事件限流 |
+| 运维安全 | 管理令牌（支持按 `release` / `rollout` / `stop-loss` / `gc` 权限位分权）、通道锁、请求幂等、审计日志、事件限流 |
+| 存储回收 | 提升 / 重发使用硬链接复用资产；`ota:gc` 按「天数 ∪ 数量」保留策略回收旧版本，联动清理补丁索引与孤儿补丁，支持 dry-run / 定时执行 / 控制台操作 |
 | 止损 / 崩溃感知 | 以「被下发 current 的设备（cohort）」统计启动失败率（应急启动 + watchdog 回退）与安装失败率；支持 `monitor` / `halt` / `rollback`、控制台「立即评估 / 紧急止血 / 恢复暂停前灰度」，以及运行时覆盖 `MIN_SAMPLES` 与 Webhook |
 | 客户端 Demo | 更新状态机、错误边界、日志脱敏、调试面板，以及 OTA 服务地址与端口显示 |
 
@@ -202,6 +204,7 @@ npm test
 | `npm run ota:embedded` | 注册构建内置包，支持首装差分 |
 | `npm run ota:patch:rebuild` | 重建差分补丁 |
 | `npm run ota:patch:verify` | 校验补丁并用 `bspatch` 逐条还原 |
+| `npm run ota:gc` | 回收旧 release（默认 dry-run，`--apply` 才会删除） |
 
 **自检与测试**
 
@@ -248,6 +251,8 @@ npm test
 │   │   ├── assets.mjs           # 资产分发、gzip、A-IM 与 Range
 │   │   ├── patch-store.mjs      # 补丁索引、base 解析与收益判定
 │   │   ├── release-store.mjs    # 通道状态、发布锁与审计
+│   │   ├── release-files.mjs    # 硬链接复用（提升 / 重发不复制字节）
+│   │   ├── gc.mjs               # 保留策略、目录回收与补丁索引联动
 │   │   ├── rollout.mjs          # uid 分桶与灰度决策
 │   │   ├── locks.mjs, lib.mjs   # 文件锁与公共工具
 │   │   ├── metrics.mjs          # 事件落盘与聚合
@@ -262,6 +267,7 @@ npm test
 │   ├── publish.mjs              # 发布、提升、重新发布
 │   ├── hotfix.mjs               # 一键热修复
 │   ├── patches.mjs              # 补丁生成 / 校验
+│   ├── gc.mjs                   # 回收旧 release（dry-run / apply / JSON）
 │   ├── register-embedded.mjs    # 注册内置包 bundle
 │   ├── rollout.mjs              # 灰度与白名单
 │   ├── rollback.mjs             # 回滚
@@ -422,12 +428,12 @@ npm run ota:rollback -- --channel beta
 
 - **概览**：统计卡、7 天请求趋势、差分命中率与节省流量、通道状态（含实际运行版本 top）和最近事件。
 - **通道**：4 个通道以 Tab 切换，按 `development → canary → beta → production` 排序；每个面板包含版本状态、平台灰度、白名单、实际运行版本、止损健康度、发布操作和可展开的最近变更。实际运行版本来自客户端最近一次上报，按设备去重，并标注与 current / previous / 内置包的对应关系。
-- **版本**：发布产物列表、平台/通道/运行状态筛选、releaseId / updateId / 运行通道关键字搜索（空格分隔多关键词）、分页、current / previous 标记，以及每个版本的补丁数、体积与「实际运行」设备分布。
+- **版本**：发布产物列表、平台/通道/运行状态筛选、releaseId / updateId / 运行通道关键字搜索（空格分隔多关键词）、分页、current / previous 标记，以及每个版本的补丁数、体积与「实际运行」设备分布；另有「回收预览」与逐行「回收」（需 `gc` 权限，current / previous 版本禁用）。
 - **指标**：状态码、平台对比、通道明细、updateId 命中，以及按平台/通道的差分明细与回退原因。
 - **事件**：服务端筛选、分页和原始事件查看（差分原始事件类型为 `asset-patch`）。
 - **设置**：左侧分类切换「管理令牌 / 止损设置」。管理令牌只存本机 `localStorage`；止损设置可改 `MIN_SAMPLES` 与告警 Webhook，运行时生效并持久化到 `$OTA_DATA_DIR/system/stop-loss.json`；Webhook 只显示是否已配置与 origin，不回显明文。也可直接访问 `#settings`。
 
-写操作需要管理令牌，令牌只保存在浏览器 `localStorage`。可同时保存 iOS / Android 灰度、维护白名单、回滚、重新发布和提升历史版本。服务端写接口使用通道锁和 `requestId` 幂等保护，审计记录写入通道 `history` 和 `audit.jsonl`。多令牌可带权限位（如 `OTA_ADMIN_TOKENS="oncall:token:stop-loss"`），止血 / 恢复 / 止损设置只需 `stop-loss` 权限，发布类动作需要 `release` 或 `rollout`。
+写操作需要管理令牌，令牌只保存在浏览器 `localStorage`。可同时保存 iOS / Android 灰度、维护白名单、回滚、重新发布和提升历史版本。服务端写接口使用通道锁和 `requestId` 幂等保护，审计记录写入通道 `history` 和 `audit.jsonl`。多令牌可带权限位（如 `OTA_ADMIN_TOKENS="oncall:token:stop-loss"`），止血 / 恢复 / 止损设置只需 `stop-loss` 权限，发布类动作需要 `release` 或 `rollout`，回收旧版本需要 `gc`。
 
 ### 本地开发与真机
 
@@ -549,6 +555,48 @@ npm run ota:embedded -- --platform android --channel development --auto
 
 `npm run ota:verify` 会对 `launchAsset` 做一次 HEAD + 两段 Range 请求，把拼接结果按 manifest 的 `asset.hash` 校验，并验证越界范围返回 `416`。
 
+### 数据保留与 GC
+
+`--touch` / `--release` 会用**硬链接**重建新版本目录：资产文件名是内容寻址的
+（`bundles/<md5>.hbc`），字节必然相同，因此提升 / 重发的磁盘增量只有 `metadata.json`
+这类小文件，不再复制整个 release。真正的空间增长来自「每次发布新增一个完整版本」。
+
+回收由 `scripts/gc.mjs` 执行，判定逻辑在 `services/ota/src/gc.mjs`：
+
+- **保护集**（任一命中即保留）：各通道 `current` / `previous`、最近 `--keep-last` 个版本、
+  `--keep-days` 天内的版本、最近 `--patch-bases` 个差分 base；
+- **默认 dry-run**，只打印保留 / 待删清单与可释放体积；
+- 与提升 / 重发共用同一把 runtimeVersion 级锁，且执行前会重新规划，
+  只删除「规划与执行两次都判定为候选」的版本；
+- 联动清理 `patches/index.json` 里引用已删版本的条目，并回收不再被引用的 `.bsdiff`；
+- 结果写入 `audit.jsonl`（`action: "gc"`，`channel: "system"`）。
+
+```bash
+npm run ota:gc -- --rv 1                                   # 预览（dry-run）
+npm run ota:gc -- --rv 1 --keep-days 14 --keep-last 10 --apply
+npm run ota:gc -- --rv 1 --apply --release <releaseId>     # 单条回收，受保护会被拒绝
+npm run ota:gc -- --apply --json                           # 遍历全部 rv，供 CI 消费
+```
+
+服务端也可定时执行（默认关闭、默认只 dry-run，先看日志再接 `apply`）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `OTA_GC_ENABLED` | `false` | 总开关 |
+| `OTA_GC_MODE` | `dry-run` | `dry-run`（只记日志）/ `apply` |
+| `OTA_GC_INTERVAL_MS` | `21600000` | 执行间隔，默认 6 小时 |
+| `OTA_GC_INITIAL_DELAY_MS` | `300000` | 启动后首次延迟，默认 5 分钟 |
+| `OTA_GC_KEEP_DAYS` | `14` | 保留天数 |
+| `OTA_GC_KEEP_LAST` | `10` | 最少保留版本数 |
+
+控制台「版本」页提供「回收预览」与逐行「回收」按钮，对应
+`POST /api/admin/actions` 的 `gc-releases` 动作，需要 `gc` 权限位；
+`current` / `previous` 版本在前端即禁用，服务端仍会二次校验保护集。
+
+> **回收不可恢复**。资产 URL 里带 `releaseId` 且响应头是 `immutable`，删掉目录后，
+> 仍持有旧 manifest 的设备会下载失败——`keep-days` 就是给这个场景留的缓冲；
+> 而 CDN 已缓存的副本不受影响，GC 回收的是源站空间，不是撤回更新。
+
 ### 代码签名
 
 - RSA-SHA256 对 manifest JSON 字节签名，算法 `rsa-v1_5-sha256`；
@@ -602,6 +650,7 @@ manifest 的 `metadata` 会返回 `channel`、`releaseId`、`rollout`、`served`
 | `restore-rollout` | `stop-loss` | 恢复止血前的灰度快照 |
 | `evaluate-stop-loss` | 只读 | 立即评估健康度，返回当前策略与样本缺口 |
 | `set-stop-loss-config` | `stop-loss` | 修改运行时 `MIN_SAMPLES` / Webhook |
+| `gc-releases` | `gc` | 回收旧 release：`releaseIds` 指定单条，`apply=false` 为预览；保护集由服务端二次校验 |
 
 ### 环境变量
 
@@ -618,7 +667,7 @@ manifest 的 `metadata` 会返回 `channel`、`releaseId`、`rollout`、`served`
 | `OTA_PRIVATE_KEY_PATH` | manifest 签名私钥，客户端要求签名时必填 |
 | `OTA_KEY_ID` | 签名 key id，默认 `main` |
 | `OTA_ADMIN_TOKEN` | 控制台和管理 API 令牌 |
-| `OTA_ADMIN_TOKENS` | 多令牌格式：`alice:token-a,bob:token-b`（冒号前为审计操作人）；可选第三段权限位用 `+` 分隔，如 `oncall:token-c:stop-loss`，支持 `release` / `rollout` / `stop-loss`，不写则为全量权限 |
+| `OTA_ADMIN_TOKENS` | 多令牌格式：`alice:token-a,bob:token-b`（冒号前为审计操作人）；可选第三段权限位用 `+` 分隔，如 `oncall:token-c:stop-loss`，支持 `release` / `rollout` / `stop-loss` / `gc`，不写则为全量权限 |
 | `OTA_OPERATOR` | CLI 操作人标签，默认 `cli` |
 | `OTA_EVENTS_RATE_LIMIT` | 每 IP 每分钟事件上报上限，默认 `60`，设为 `0` 关闭 |
 | `OTA_TLS_KEY` / `OTA_TLS_CERT` | 可选，直接由 Node 提供 HTTPS |
@@ -629,6 +678,7 @@ manifest 的 `metadata` 会返回 `channel`、`releaseId`、`rollout`、`served`
 | `OTA_PATCH_MAX_BASES` | 发布时预生成的 base 版本数，默认 `5` |
 | `OTA_BSDIFF_BIN` / `OTA_BSPATCH_BIN` | 发布期 `bsdiff` / `bspatch` 命令路径 |
 | `OTA_REGISTER_EMBEDDED` | dev 构建后自动注册内置包，设为 `0` 关闭 |
+| `OTA_GC_ENABLED` / `MODE` / `INTERVAL_MS` / `INITIAL_DELAY_MS` / `KEEP_DAYS` / `KEEP_LAST` | 存储回收配置，默认关闭且只 dry-run；详见[数据保留与 GC](#数据保留与-gc) |
 
 **客户端构建**
 
@@ -666,6 +716,8 @@ npm test
 - 差分协商 `226` / 回退分支、补丁索引与收益判定、差分指标口径
 - 单区间 Range 的 `206` / `416`、`If-Range` 降级、HEAD 探测、gzip/差分绕过与分片拼接还原
 - 止损 cohort 统计、halt / restore 语义、重复止血幂等、运行时覆盖优先级与 Webhook 平台消息体
+- GC 保护集（通道指针 / keep-last / keep-days / patch base）、dry-run 只读、二次校验跳过、补丁索引与孤儿补丁联动、并发串行、审计归属 `system`
+- 硬链接复用：inode 一致、删除源目录后仍可读、不支持硬链接时回退拷贝
 
 ## 生产部署
 
@@ -678,14 +730,15 @@ npm test
 5. 只运行一个写入实例；当前通道锁和 JSON 数据存储不做多副本协调。
 6. 在 App Store / Google Play 发布前替换示例 Bundle ID、包名和签名证书。
 7. 按需启用止损：先 `OTA_STOP_LOSS_ENABLED=true` + `OTA_STOP_LOSS_MODE=monitor` 配好告警 Webhook，观察阈值后再切 `halt`。
-8. 备份 `services/ota/updates` 时一并包含 `system/stop-loss.json`（控制台写入的运行时止损设置）；多令牌按需分配 `release` / `rollout` / `stop-loss` 权限位。
+8. 备份 `services/ota/updates` 时一并包含 `system/stop-loss.json`（控制台写入的运行时止损设置）；多令牌按需分配 `release` / `rollout` / `stop-loss` / `gc` 权限位。
+9. 存储回收：先用 `npm run ota:gc -- --rv <rv>` 观察待删清单，再配置定时任务（如每天一次 `--apply`），或开启 `OTA_GC_ENABLED=true` 并先以 `OTA_GC_MODE=dry-run` 跑一周；`keep-days` 至少覆盖客户端最长离线时间。
 
 ### 安全说明
 
 - manifest 和 assets 默认公开可拉取；签名用于完整性校验，不提供访问控制。
 - `/api/events` 是公网写入口，已实现限流和 16 KB 请求体限制，生产仍建议在反向代理层增加额外限制。
 - 管理令牌只存在浏览器本地，换浏览器需要重新输入；未配置令牌时管理写接口一律返回 `403`。
-- 多令牌可用 `OTA_ADMIN_TOKENS` 第三段分配权限位（`release` / `rollout` / `stop-loss`）；建议给 on-call 只发 `stop-loss` 窄令牌。
+- 多令牌可用 `OTA_ADMIN_TOKENS` 第三段分配权限位（`release` / `rollout` / `stop-loss` / `gc`）；建议给 on-call 只发 `stop-loss` 窄令牌，`gc` 单独发给负责容量的人（删除不可恢复）。
 - 控制台「设置」保存的 Webhook 只在看板回显 origin、不返回完整地址；运行时覆盖文件 `system/stop-loss.json` 含 Webhook（可能带 token），需限制数据目录权限并谨慎备份。
 - 生产构建必须关闭 `EXPO_PUBLIC_ENABLE_CHANNEL_SWITCH`，避免关闭防砖保护。
 - 不要提交 `.env`、私钥、Provisioning Profile、Keystore 或真实用户 uid；`apps/mobile/certs/certificate.pem` 是公开验签证书，可以提交。
@@ -696,7 +749,7 @@ npm test
 
 - 单机部署：通道状态是本地 JSON，幂等缓存与请求队列是进程内内存；文件锁依赖共享文件系统，只能在同一挂载卷内互斥，不支持多副本 / 多机并发写。
 - 事件与指标只写本地 `events.jsonl`（5 MB 轮转），指标按 7 天窗口聚合；没有长期存储或外部监控对接，告警仅支持 Webhook（fire-and-forget，无重试队列）。
-- 旧 release 不会自动 GC，提升和重新发布会复制目录。
+- 旧 release 默认不自动回收：需要显式执行 `npm run ota:gc` 或开启 `OTA_GC_ENABLED`；提升 / 重发已改为硬链接复用，不再复制字节。备份工具需保留硬链接（`rsync -H`）或接受展开后的体积。
 - 未包含原生崩溃采集、符号化、CI/CD 或容器编排配置。
 
 **发布与版本**
@@ -730,12 +783,14 @@ npm test
 | App 仍运行旧代码 | OTA 通常在下一次冷启动生效；连续冷启动两次验证 |
 | Android 安装失败 `INSTALL_FAILED_USER_RESTRICTED` | 在开发者选项中允许 USB 安装 |
 | iOS 提示未信任开发者 | 在系统设置中信任开发者证书后重新启动 App |
-| 控制台写操作返回 403 | 服务端未配置管理令牌、浏览器令牌无效，或该令牌缺少对应权限位（止血 / 恢复需 `stop-loss`） |
+| 控制台写操作返回 403 | 服务端未配置管理令牌、浏览器令牌无效，或该令牌缺少对应权限位（止血 / 恢复需 `stop-loss`，回收需 `gc`） |
 | 控制台提示「未知操作: xxx」 | 运行中的服务是旧进程，重启 `npm run ota:start` 加载新代码（HTML/JS 热加载，后端模块需重启） |
 | 止损一直「样本不足」 | 检查 cohort 是否有 manifest / launch 上报、`MIN_SAMPLES` 与窗口是否合适、通道是否有真实设备流量 |
 | 止血后设备没回退 | `halt` 只挡住新设备，需重发布上一版或执行 `ota:rollback` 才能真正回退 |
 | Webhook 收不到消息 | 是否已保存、monitor 下是否超阈值、是否在告警冷却期、机器人地址与平台格式是否匹配 |
 | 发布提示锁被占用 | 检查残留 `.lock` 和正在运行的发布进程 |
+| 磁盘持续增长 | `npm run ota:gc -- --rv <rv>` 查看待删清单；确认保留策略与备份口径后再加 `--apply`，或开启 `OTA_GC_ENABLED` 定时回收 |
+| 回收提示「受保护」 | 该版本仍是某通道 current / previous、最近差分 base，或仍在 `keep-days` 内；先切换指针或等待保留期结束 |
 | 删除数据后通道消失 | 通道是懒创建的，重新发布即可恢复 |
 | 客户端仍下载完整包 | 是否发布过至少两个版本；`patches/index.json` 是否存在；`OTA_PATCH_ENABLED` 与 `OTA_PATCH_MIN_SAVING`；base updateId 是否已注册 |
 | 补丁还原失败后回退全量 | 执行 `npm run ota:patch:verify -- --rv 1`，确认 `bsdiff` / `bspatch` 产出标准 `BSDIFF40` |

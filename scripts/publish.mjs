@@ -26,8 +26,10 @@ import {
   promoteRelease,
   readChannel,
   releaseDir,
+  runtimeLockFile,
   setRollback,
 } from '../services/ota/src/release-store.mjs';
+import { linkOrCopyFile, linkTree } from '../services/ota/src/release-files.mjs';
 import { withLock } from '../services/ota/src/locks.mjs';
 import { generatePatchesForRelease } from './patches.mjs';
 
@@ -368,6 +370,78 @@ async function finalizePublish(runtimeVersion, args) {
   process.exitCode = result.status === 0 ? 0 : 1;
 }
 
+/**
+ * 基于已有 release 重新发布（promote / republish）。
+ * expo-updates 只接受 createdAt 更新的 manifest，所以不能只改指针，
+ * 必须新生成目录并刷新时间戳。
+ *
+ * 资产文件名是内容寻址的（bundles/<md5>.hbc），新旧目录里的文件字节完全一致，
+ * 因此用硬链接重建目录：单次提升的磁盘增量从「整个 release」降到元数据文件。
+ */
+async function promoteExistingRelease(runtimeVersion, args, rollout) {
+  const sourceDir = releaseDir(runtimeVersion, args.release);
+  const sourceMeta = await readJson(path.join(sourceDir, 'metadata.json'));
+  if (!sourceMeta) {
+    throw new Error(`版本 ${args.release} 缺少 metadata.json`);
+  }
+
+  const newReleaseId = String(Date.now());
+  const targetDir = releaseDir(runtimeVersion, newReleaseId);
+  await fsp.mkdir(targetDir, { recursive: true });
+
+  let linked = 0;
+  let copied = 0;
+  for (const sub of ['bundles', 'assets']) {
+    const stats = await linkTree(
+      path.join(sourceDir, sub),
+      path.join(targetDir, sub),
+    );
+    linked += stats.linked;
+    copied += stats.copied;
+  }
+  const expoConfigSrc = path.join(sourceDir, 'expoConfig.json');
+  if (fs.existsSync(expoConfigSrc)) {
+    // expoConfig 内容与源版本一致，可以复用同一 inode；
+    // metadata.json 的 id / createdAt 变了，必须新写。
+    await linkOrCopyFile(expoConfigSrc, path.join(targetDir, 'expoConfig.json'));
+  }
+
+  const createdAt = new Date().toISOString();
+  const id = hexToUuid(
+    sha256Hex(Buffer.from(`${runtimeVersion}:${newReleaseId}`)),
+  );
+  await writeJsonAtomic(path.join(targetDir, 'metadata.json'), {
+    ...sourceMeta,
+    id,
+    createdAt,
+    restoredFrom: args.release,
+    metadata: { ...(sourceMeta.metadata || {}), channel: args.channel },
+  });
+  await maybeGeneratePatches(runtimeVersion, newReleaseId, args);
+  await withLock(
+    `${runtimeVersion}:${args.channel}`,
+    channelLockFile(runtimeVersion, args.channel),
+    () =>
+      promoteRelease(runtimeVersion, args.channel, newReleaseId, {
+        updateId: id,
+        createdAt,
+        rollout,
+        action: args.touch ? 'republish' : 'promote',
+        operator: args.operator,
+        via: args.via,
+        requestId: args.requestId,
+        params: { restoredFrom: args.release, rollout },
+      }),
+  );
+  console.log(
+    `\n[publish] 已基于版本 ${args.release} 重新发布（通道 ${args.channel}）`,
+  );
+  console.log(`  新版本目录: ${path.relative(ROOT, targetDir)}`);
+  console.log(`  updateId: ${id}`);
+  console.log(`  资产复用: 硬链接 ${linked} 个 / 拷贝 ${copied} 个`);
+  console.log('  已刷新 createdAt，确保客户端接受该更新');
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const runtimeVersion = resolveRuntimeVersion(args.runtimeVersion);
@@ -451,61 +525,16 @@ async function main() {
         `版本 ${args.release} 不存在。可用版本: ${ids.join(', ') || '(无)'}`,
       );
     }
-    const sourceDir = releaseDir(runtimeVersion, args.release);
-    const sourceMeta = await readJson(path.join(sourceDir, 'metadata.json'));
-    if (!sourceMeta) {
-      throw new Error(`版本 ${args.release} 缺少 metadata.json`);
-    }
-
-    // 不能只把指针指回旧目录：expo-updates 会因该版本的 createdAt 早于当前
-    // 运行版本而跳过。因此复制其内容重新发布一个新版本，刷新时间戳。
-    const newReleaseId = String(Date.now());
-    const targetDir = releaseDir(runtimeVersion, newReleaseId);
-    await fsp.mkdir(targetDir, { recursive: true });
-    for (const sub of ['bundles', 'assets']) {
-      const src = path.join(sourceDir, sub);
-      if (fs.existsSync(src)) {
-        await fsp.cp(src, path.join(targetDir, sub), { recursive: true });
-      }
-    }
-    const expoConfigSrc = path.join(sourceDir, 'expoConfig.json');
-    if (fs.existsSync(expoConfigSrc)) {
-      await fsp.copyFile(expoConfigSrc, path.join(targetDir, 'expoConfig.json'));
-    }
-
-    const createdAt = new Date().toISOString();
-    const id = hexToUuid(
-      sha256Hex(Buffer.from(`${runtimeVersion}:${newReleaseId}`)),
-    );
-    await writeJsonAtomic(path.join(targetDir, 'metadata.json'), {
-      ...sourceMeta,
-      id,
-      createdAt,
-      restoredFrom: args.release,
-      metadata: { ...(sourceMeta.metadata || {}), channel: args.channel },
-    });
-    await maybeGeneratePatches(runtimeVersion, newReleaseId, args);
+    // 与 GC 互斥：链接目录、生成补丁、写指针必须在同一次 rv 级持锁内完成，
+    // 否则 GC 可能在提升过程中删掉正在被读的源版本目录。
     await withLock(
-      `${runtimeVersion}:${args.channel}`,
-      channelLockFile(runtimeVersion, args.channel),
-      () =>
-        promoteRelease(runtimeVersion, args.channel, newReleaseId, {
-          updateId: id,
-          createdAt,
-          rollout,
-          action: args.touch ? 'republish' : 'promote',
-          operator: args.operator,
-          via: args.via,
-          requestId: args.requestId,
-          params: { restoredFrom: args.release, rollout },
-        }),
+      `${runtimeVersion}:runtime`,
+      runtimeLockFile(runtimeVersion),
+      () => promoteExistingRelease(runtimeVersion, args, rollout),
+      { timeout: 60_000 },
     );
-    console.log(
-      `\n[publish] 已基于版本 ${args.release} 重新发布（通道 ${args.channel}）`,
-    );
-    console.log(`  新版本目录: ${path.relative(ROOT, targetDir)}`);
-    console.log(`  updateId: ${id}`);
-    console.log('  已刷新 createdAt，确保客户端接受该更新');
+    // 自检与自动回滚必须在锁外：--auto-rollback-on-fail 会再 spawn 一次
+    // `--release`，那个子进程同样要拿 rv 级锁，锁内调用会互相等待直到超时。
     await finalizePublish(runtimeVersion, args);
     return;
   }

@@ -10,13 +10,15 @@ import {
   PUBLIC_BASE_URL,
   UPDATES_DIR,
   assertServiceConfig,
+  gcConfig,
   hasScope,
   stopLossConfig,
 } from './config.mjs';
 import { performAdminAction, requiredScope, resolveAdmin } from './admin.mjs';
 import { serveAsset } from './assets.mjs';
+import { applyGc, planGc } from './gc.mjs';
 import { buildManifestResponse, resolveChannel } from './manifest.mjs';
-import { listChannels, readAudit, readChannel } from './release-store.mjs';
+import { listChannels, readAudit, readChannel, runtimeVersions } from './release-store.mjs';
 import { aggregateMetrics, recordEvent } from './metrics.mjs';
 import { buildDashboardState } from './dashboard.mjs';
 import { renderDashboardHtml } from './dashboard-view.mjs';
@@ -277,6 +279,12 @@ export async function handle(req, res) {
             mode: payload.mode,
             minSamples: payload.minSamples,
             webhook: payload.webhook,
+            // GC：releaseIds 为空表示按保留策略整体回收；apply=false 为预览。
+            releaseIds: payload.releaseIds,
+            apply: payload.apply,
+            keepDays: payload.keepDays,
+            keepLast: payload.keepLast,
+            patchBases: payload.patchBases,
           },
           { operator, via: 'dashboard', requestId, source },
         );
@@ -306,6 +314,13 @@ export async function handle(req, res) {
           secure,
           env: OTA_ENV,
           publicBaseUrl: PUBLIC_BASE_URL,
+          // 只暴露「有没有在跑、上次跑成什么样」，不回显被回收的版本清单。
+          gc: {
+            enabled: gcState.enabled,
+            mode: gcState.mode,
+            lastRunAt: gcState.lastRunAt,
+            lastError: gcState.lastError,
+          },
         }),
       });
     }
@@ -505,6 +520,72 @@ export async function handle(req, res) {
   }
 }
 
+/**
+ * 存储回收（GC）的进程内状态。
+ * 定时器只在单写实例下有意义（与通道锁 / JSON 存储的前提一致）。
+ */
+const gcState = {
+  enabled: false,
+  mode: 'dry-run',
+  lastRunAt: null,
+  lastError: null,
+};
+
+/** 遍历所有 runtimeVersion 跑一次规划；apply 模式下才真正删除。 */
+async function runGcOnce() {
+  const cfg = gcConfig();
+  const versions = await runtimeVersions();
+  let candidates = 0;
+  let removed = 0;
+  let bytes = 0;
+  for (const runtimeVersion of versions) {
+    try {
+      const plan = await planGc(runtimeVersion, cfg);
+      candidates += plan.candidates.length;
+      if (cfg.mode !== 'apply' || plan.candidates.length === 0) continue;
+      const result = await applyGc(runtimeVersion, plan, {
+        operator: 'gc-scheduler',
+        via: 'server',
+      });
+      removed += result.removed.length;
+      bytes += result.reclaimedBytes;
+      for (const item of result.failed) {
+        console.error(`[ota] GC 删除失败: ${item.releaseId} -> ${item.error}`);
+      }
+    } catch (error) {
+      gcState.lastError = `rv ${runtimeVersion}: ${error.message}`;
+      console.error(`[ota] GC(rv ${runtimeVersion}) 失败:`, error.message);
+    }
+  }
+  gcState.lastRunAt = new Date().toISOString();
+  console.log(
+    `[ota] GC(${cfg.mode}): 候选 ${candidates} 个，回收 ${removed} 个 / ${bytes}B`,
+  );
+  return { candidates, removed, bytes };
+}
+
+/** 定时 GC 默认关闭；开启后也默认 dry-run，便于先观察日志再接 apply。 */
+function scheduleGc() {
+  const cfg = gcConfig();
+  gcState.enabled = cfg.enabled;
+  gcState.mode = cfg.mode;
+  if (!cfg.enabled) return;
+
+  console.log(
+    `[ota] 存储回收: 已启用（mode=${cfg.mode}，keep-days=${cfg.keepDays}，` +
+      `keep-last=${cfg.keepLast}，间隔 ${Math.round(cfg.intervalMs / 60000)} 分钟）`,
+  );
+  const first = setTimeout(() => {
+    runGcOnce().catch((error) => console.error('[ota] GC 失败:', error.message));
+  }, cfg.initialDelayMs);
+  const timer = setInterval(() => {
+    runGcOnce().catch((error) => console.error('[ota] GC 失败:', error.message));
+  }, cfg.intervalMs);
+  // 不要因为定时器阻止进程退出（容器里 SIGTERM 后应尽快结束）。
+  first.unref?.();
+  timer.unref?.();
+}
+
 async function main() {
   assertServiceConfig();
 
@@ -554,6 +635,7 @@ async function main() {
     console.log(
       '[ota] manifest: /api/manifest | assets: /api/assets | channels: /api/channels | metrics: /api/metrics | events: POST /api/events',
     );
+    scheduleGc();
   });
 }
 

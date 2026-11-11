@@ -32,6 +32,9 @@ const PROJECT_ROOT = path.resolve(
   '..',
 );
 const PUBLISH_SCRIPT = path.join(PROJECT_ROOT, 'scripts', 'publish.mjs');
+const GC_SCRIPT = path.join(PROJECT_ROOT, 'scripts', 'gc.mjs');
+/** 回收要遍历 / 删除目录，比发布慢得多，单独给更长的超时。 */
+const GC_TIMEOUT_MS = 5 * 60 * 1000;
 
 function providedToken(req) {
   const auth = String(req.headers.authorization || '');
@@ -73,6 +76,7 @@ const ACTION_SCOPES = {
   'halt-channel': 'stop-loss',
   'restore-rollout': 'stop-loss',
   'set-stop-loss-config': 'stop-loss',
+  'gc-releases': 'gc',
 };
 
 export function requiredScope(action) {
@@ -99,6 +103,63 @@ function runPublish(args) {
     throw new Error(detail.slice(-800) || `发布脚本退出码 ${result.status}`);
   }
   return (result.stdout || '').trim();
+}
+
+/**
+ * 回收旧 release：复用 CLI 的保护集与补丁联动逻辑。
+ * 用 spawn 而不是同进程调用，是因为删除大目录会长时间阻塞事件循环，
+ * 期间所有 manifest / asset 请求都会被拖住。
+ *
+ * 服务端仍会重新校验保护集（由 gc.mjs 负责），前端禁用只是 UX。
+ */
+function runGc(runtimeVersion, input, { operator, via, requestId }) {
+  const targets = (Array.isArray(input.releaseIds) ? input.releaseIds : [])
+    .map((id) => String(id).trim())
+    .filter((id) => /^\d+$/.test(id));
+  const args = [
+    GC_SCRIPT,
+    '--rv',
+    String(runtimeVersion),
+    '--json',
+    '--operator',
+    operator,
+    '--via',
+    via,
+    input.apply === true ? '--apply' : '--dry-run',
+  ];
+  if (requestId) args.push('--request-id', requestId);
+  for (const key of ['keepDays', 'keepLast', 'patchBases']) {
+    if (input[key] !== undefined && input[key] !== null) {
+      args.push(`--${key.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`, String(input[key]));
+    }
+  }
+  for (const id of targets) args.push('--release', id);
+
+  const result = spawnSync(process.execPath, args, {
+    cwd: PROJECT_ROOT,
+    encoding: 'utf8',
+    timeout: GC_TIMEOUT_MS,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const detail = (result.stderr || result.stdout || '').trim();
+    throw new Error(detail.slice(-800) || `回收脚本退出码 ${result.status}`);
+  }
+
+  let parsed = {};
+  try {
+    parsed = JSON.parse((result.stdout || '').trim() || '{}');
+  } catch {
+    throw new Error('回收结果解析失败，请检查服务端日志');
+  }
+  const entry = parsed.results?.[0] || {};
+  const plan = entry.plan || {};
+  const removed = entry.result?.removed || [];
+  const bytes = entry.result?.reclaimedBytes ?? plan.reclaimableBytes ?? 0;
+  const message = entry.dryRun
+    ? `回收预览（dry-run）：${plan.candidates?.length ?? 0} 个版本 / ${bytes} 字节可释放`
+    : `已回收 ${removed.length} 个版本 / ${bytes} 字节`;
+  return { message, operator, duplicated: false };
 }
 
 /**
@@ -189,6 +250,18 @@ export async function performAdminAction(input, context = {}) {
   // 全局设置不针对通道，提前返回，避免占用通道锁。
   if (input.action === 'set-stop-loss-config') {
     return saveStopLossSettings(input, { operator, via, requestId, source, rv });
+  }
+
+  // GC 同样不针对通道：脚本内部持 runtimeVersion 级锁（与提升 / 重发互斥），
+  // 这里不能再拿通道锁，否则会与 publish 的加锁顺序冲突。
+  if (input.action === 'gc-releases') {
+    if (requestId) {
+      const cached = recallRequest(`req:${requestId}`);
+      if (cached) return { ...cached, duplicated: true };
+    }
+    const result = runGc(rv, input, { operator, via, requestId });
+    if (requestId) rememberRequest(`req:${requestId}`, result);
+    return result;
   }
 
   const name = normalizeChannel(input.channel);

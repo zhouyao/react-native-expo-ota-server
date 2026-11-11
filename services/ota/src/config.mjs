@@ -39,9 +39,10 @@ export const ADMIN_TOKEN = process.env.OTA_ADMIN_TOKEN || '';
  *   - release：发布 / 提升 / 回滚 / 重发
  *   - rollout：调整灰度与白名单
  *   - stop-loss：紧急止血 / 恢复暂停前灰度
+ *   - gc：回收旧 release（不可恢复，与发布权限分开）
  * 只读评估（evaluate-stop-loss）不需要 scope。
  */
-export const ADMIN_SCOPES = ['release', 'rollout', 'stop-loss'];
+export const ADMIN_SCOPES = ['release', 'rollout', 'stop-loss', 'gc'];
 
 /** 解析 scope 段：返回 { scopes } 或 null（null 表示这一段不是合法的 scope）。 */
 function splitScopeSegment(segment) {
@@ -232,6 +233,24 @@ export function stopLossConfig() {
       minSamples: override.minSamples !== undefined,
       webhook: override.webhook !== undefined,
     },
+  };
+}
+
+/**
+ * 存储回收（GC）配置：默认关闭，且默认只做 dry-run。
+ * 与止损哨兵一样按需读取，避免模块加载时固化，便于测试覆盖。
+ * 回收不可恢复，因此线上开启时建议先观察一段 dry-run 日志再切 apply。
+ */
+export function gcConfig() {
+  const mode = String(process.env.OTA_GC_MODE || 'dry-run').toLowerCase();
+  return {
+    enabled: String(process.env.OTA_GC_ENABLED || '').toLowerCase() === 'true',
+    mode: mode === 'apply' ? 'apply' : 'dry-run',
+    intervalMs: envNumber('OTA_GC_INTERVAL_MS', 6 * 60 * 60 * 1000, { min: 60_000, strict: true }),
+    initialDelayMs: envNumber('OTA_GC_INITIAL_DELAY_MS', 5 * 60 * 1000, { min: 0 }),
+    keepDays: envNumber('OTA_GC_KEEP_DAYS', 14, { min: 0 }),
+    // min=0 + strict：允许 1，拒绝 0（否则可能连最新版本一起回收）。
+    keepLast: envNumber('OTA_GC_KEEP_LAST', 10, { min: 0, strict: true }),
   };
 }
 

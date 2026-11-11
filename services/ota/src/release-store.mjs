@@ -4,6 +4,8 @@ import { UPDATES_DIR } from './config.mjs';
 import { readJson, safeJoin, writeJsonAtomic } from './lib.mjs';
 
 export const DEFAULT_CHANNEL = 'production';
+/** 审计里的「非通道」归属：止损设置、GC 这类全局动作。 */
+export const SYSTEM_CHANNEL = 'system';
 export const MAX_HISTORY = 20;
 
 export function normalizeChannel(channel) {
@@ -66,6 +68,28 @@ export function channelLockFile(runtimeVersion, channel) {
   );
 }
 
+/**
+ * runtimeVersion 级锁：GC 会跨通道删除目录，必须与「提升 / 重发」互斥，
+ * 否则 GC 可能在复制（硬链接）源目录的过程中把它删掉。
+ * 加锁顺序统一为 runtime → channel，避免与发布路径互相死锁。
+ */
+export function runtimeLockFile(runtimeVersion) {
+  return safeJoin(runtimeDir(runtimeVersion), '.locks', 'runtime.lock');
+}
+
+/** 数据目录下已存在的 runtimeVersion 列表（看板与 GC 共用）。 */
+export async function runtimeVersions() {
+  try {
+    const entries = await fsp.readdir(UPDATES_DIR, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
+      .map((entry) => entry.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
 /** 统一的审计条目：history 与 audit.jsonl 共用，保证字段一致。 */
 export function auditEntry({
   action,
@@ -81,7 +105,9 @@ export function auditEntry({
   return {
     at: new Date().toISOString(),
     action,
-    channel: normalizeChannel(channel),
+    // 全局动作（止损设置 / GC）用 'system' 归类；它不是一个可发布通道，
+    // 若走 normalizeChannel 会被回落成 production，审计归属就错了。
+    channel: channel === SYSTEM_CHANNEL ? SYSTEM_CHANNEL : normalizeChannel(channel),
     releaseId: releaseId || null,
     updateId: updateId || null,
     operator,
@@ -119,7 +145,9 @@ export async function readAudit(runtimeVersion, { channel = '', limit = 100 } = 
       if (!line.trim()) continue;
       try {
         const item = JSON.parse(line);
-        if (channel && item.channel !== normalizeChannel(channel)) continue;
+        const wanted =
+          channel === SYSTEM_CHANNEL ? SYSTEM_CHANNEL : normalizeChannel(channel);
+        if (channel && item.channel !== wanted) continue;
         items.push(item);
       } catch {
         // 跳过损坏行
