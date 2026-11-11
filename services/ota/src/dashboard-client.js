@@ -3,7 +3,7 @@
 (function () {
   'use strict';
 
-  var TABS = ['overview', 'channels', 'updates', 'metrics', 'events'];
+  var TABS = ['overview', 'channels', 'updates', 'metrics', 'events', 'settings'];
 
   var ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
   function esc(v) {
@@ -31,6 +31,36 @@
   }
   function pct(part, total) {
     return total ? Math.round((part / total) * 100) : 0;
+  }
+  /** 比率（0-1）→ 百分比字符串，保留一位小数。 */
+  function ratePct(v) {
+    return (Math.round((Number(v) || 0) * 1000) / 10) + '%';
+  }
+  /** 止损健康徽标：自动动作已关闭 / 健康 / 告警 / 已止损。 */
+  function healthBadge(health) {
+    if (!health) return '';
+    if (!health.enabled) {
+      return '<span class="tag gray" title="设置 OTA_STOP_LOSS_ENABLED=true 开启；健康度仍在统计">自动止损已关闭</span>';
+    }
+    var cls = 'green';
+    var label = '健康';
+    if (health.verdict === 'alert') { cls = 'amber'; label = '告警'; }
+    else if (health.verdict === 'halt' || health.verdict === 'rollback') { cls = 'red'; label = '已止损'; }
+    else if (health.reason === 'insufficient-samples') { cls = 'gray'; label = '样本不足'; }
+    var failRate = health.launchFailRate === undefined
+      ? health.emergencyRate
+      : health.launchFailRate;
+    return '<span class="tag ' + cls + '">' + label + '</span>'
+      + '<span class="meta" title="启动失败率（应急+回退） / 安装失败率">失败 ' + ratePct(failRate)
+      + ' · 安装 ' + ratePct(health.installFailRate)
+      + (health.fallback ? ' · 回退 ' + esc(health.fallback) : '') + '</span>';
+  }
+  /** 实际运行版本与通道指针对齐的徽标。 */
+  function runningKindTag(kind) {
+    if (kind === 'current') return '<span class="tag green">current</span>';
+    if (kind === 'previous') return '<span class="tag amber">previous</span>';
+    if (kind === 'embedded') return '<span class="tag gray">内置</span>';
+    return '<span class="tag red">其他</span>';
   }
   function $(sel) { return document.querySelector(sel); }
   function clamp(v, min, max) {
@@ -69,7 +99,8 @@
     platform: state.platform || '',
     auto: true,
     channel: '',
-    updates: { platform: '', page: 1, size: 10 },
+    settings: { tab: 'token' },
+    updates: { platform: '', channel: '', run: '', query: '', page: 1, size: 10 },
     events: {
       // 事件页专属平台过滤，不写回 view.platform，避免影响指标/概览/通道卡。
       platform: bootQuery.platform || '',
@@ -100,7 +131,9 @@
     el.className = kind || '';
     el.textContent = text;
     box.appendChild(el);
-    setTimeout(function () { el.remove(); }, 3600);
+    // 长消息（如评估结果）多留一会儿，避免还没看完就消失。
+    var ms = String(text || '').length > 80 ? 6000 : 3600;
+    setTimeout(function () { el.remove(); }, ms);
   }
 
   function token() {
@@ -114,6 +147,85 @@
   function newRequestId() {
     if (window.crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
     return 'r-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+  }
+
+  /** 打开设置页并按需聚焦令牌输入（缺令牌 / 401 时使用）。 */
+  function openSettings(focusToken) {
+    if (location.hash !== '#settings') location.hash = '#settings';
+    renderTab('settings');
+    if (focusToken) {
+      var input = $('#token');
+      if (input && input.focus) input.focus();
+    }
+  }
+
+  /** 设置页的止损输入是否被用户改过；改过就不被自动刷新覆盖。 */
+  function settingsDirty() {
+    var min = $('#slMinSamples');
+    if (min && min.dataset.orig !== undefined && min.value !== min.dataset.orig) return true;
+    var webhook = $('#slWebhook');
+    if (webhook && webhook.value) return true;
+    var clear = $('#slWebhookClear');
+    if (clear && clear.checked) return true;
+    return false;
+  }
+
+  /** 回填止损设置（force=true 时无条件覆盖，用于保存成功后）。 */
+  function syncStopLossSettings(force) {
+    var sl = state.stopLoss || {};
+    var dirty = settingsDirty();
+    if (force || !dirty) {
+      var min = $('#slMinSamples');
+      if (min) {
+        min.value = sl.minSamples === undefined ? '' : String(sl.minSamples);
+        min.dataset.orig = min.value;
+      }
+      var webhook = $('#slWebhook');
+      if (webhook) {
+        webhook.value = '';
+        webhook.placeholder = sl.webhookConfigured
+          ? '已配置' + (sl.webhookOrigin ? '（' + sl.webhookOrigin + '）' : '') + '，留空不修改'
+          : 'https://oapi.dingtalk.com/robot/send?access_token=...';
+      }
+      var clear = $('#slWebhookClear');
+      if (clear) clear.checked = false;
+    }
+    var hint = $('#stopLossHint');
+    if (hint) {
+      hint.textContent = 'MIN_SAMPLES=' + (sl.minSamples === undefined ? '-' : String(sl.minSamples))
+        + ' · Webhook ' + (sl.webhookConfigured ? '已配置' : '未配置');
+    }
+    var source = $('#slSource');
+    if (source) {
+      var ov = sl.overridden || {};
+      var policy = !sl.enabled
+        ? '自动止损已关闭'
+        : sl.mode === 'monitor'
+          ? '仅监控（只告警）'
+          : sl.mode === 'rollback'
+            ? '自动止血并标记待回滚'
+            : sl.mode === 'halt'
+              ? '自动止血'
+              : '未知';
+      source.textContent = '当前策略：' + policy
+        + (ov.minSamples || ov.webhook ? ' · 部分项由控制台覆盖' : ' · 全部来自环境变量');
+    }
+  }
+
+  /** 设置页：左侧分类切换右侧内容。 */
+  function renderSettings() {
+    var tab = view.settings.tab || 'token';
+    var items = document.querySelectorAll('#settingsNav [data-settings-tab]');
+    for (var i = 0; i < items.length; i += 1) {
+      var active = items[i].dataset.settingsTab === tab;
+      items[i].classList.toggle('active', active);
+      items[i].setAttribute('aria-selected', String(active));
+    }
+    var panels = document.querySelectorAll('[data-settings-panel]');
+    for (var j = 0; j < panels.length; j += 1) {
+      panels[j].hidden = panels[j].dataset.settingsPanel !== tab;
+    }
+    syncStopLossSettings(false);
   }
 
   // ---------- 渲染：概览 ----------
@@ -161,14 +273,22 @@
       var badge = c.rollback ? '<span class="tag red">回滚指令</span>'
         : c.inheritedFrom ? '<span class="tag amber">继承</span>'
           : '';
-      return '<tr><td><b>' + esc(c.channel) + '</b> ' + badge + '</td>'
+      var topRun = c.running && c.running.versions && c.running.versions[0];
+      var runCell = topRun
+        ? '<span class="mono" title="' + escAttr(topRun.updateId || 'embedded') + '">'
+          + esc(fmtShort(topRun.updateId || 'embedded')) + '</span> '
+          + '<span class="meta">' + esc(topRun.devices) + ' 台</span> '
+          + runningKindTag(topRun.kind)
+        : '<span class="empty">暂无上报</span>';
+      return '<tr><td><b>' + esc(c.channel) + '</b> ' + badge + ' ' + healthBadge(c.health) + '</td>'
         + '<td class="mono" title="' + escAttr(c.releaseId) + '">' + esc(fmtShort(c.releaseId)) + '</td>'
+        + '<td>' + runCell + '</td>'
         + '<td>' + clamp(c.rollout && c.rollout.percentage, 0, 100) + '%' + platformRolloutTag(c.rollout) + '</td>'
         + '<td>' + esc(cm.total || 0) + '</td>'
         + '<td>' + esc(cm.errors || 0) + '</td></tr>';
     }).join('');
-    $('#overviewChannels').innerHTML = '<table><thead><tr><th>通道</th><th>current</th><th>灰度</th><th>7天</th><th>错误</th></tr></thead><tbody>'
-      + (rows || '<tr><td colspan="5" class="empty">暂无通道</td></tr>') + '</tbody></table>';
+    $('#overviewChannels').innerHTML = '<table><thead><tr><th>通道</th><th>current</th><th>实际运行</th><th>灰度</th><th>7天</th><th>错误</th></tr></thead><tbody>'
+      + (rows || '<tr><td colspan="6" class="empty">暂无通道</td></tr>') + '</tbody></table>';
   }
 
   function renderOverviewEvents() {
@@ -237,6 +357,68 @@
       var hasPrevious = Boolean(c.previous && c.previous.releaseId);
       var rollbackDisabled = (!state.adminEnabled || !hasPrevious) ? ' disabled' : '';
       var republishDisabled = (!state.adminEnabled || !c.releaseId) ? ' disabled' : '';
+      var health = c.health || null;
+      var sl = c.stopLoss || null;
+      var canRestore = Boolean(sl && sl.previousRollout);
+      var policyText = !health
+        ? '未知'
+        : !health.enabled
+          ? '已关闭（仅展示健康度，不自动动作）'
+          : health.mode === 'monitor'
+            ? '仅监控（超阈值只告警，不自动动作）'
+            : health.mode === 'rollback'
+              ? '自动止血并标记待回滚'
+              : health.mode === 'halt'
+                ? '自动止血（超阈值直接降为 0%）'
+                : '未知';
+      var healthSection = '<div class="ch-section"><div class="ch-section-head">'
+        + '<div><h3>止损 / 健康度</h3><p>口径：被本通道下发过 current 的设备中，应急启动率与安装失败率</p></div>'
+        + '<div class="inline">'
+        + '<button type="button" data-act="evaluate-stop-loss"' + disabled + ' title="只读评估当前健康度，不改灰度">立即评估</button>'
+        + '<button type="button" class="danger" data-act="halt-channel"'
+        + (state.adminEnabled && c.releaseId ? '' : ' disabled')
+        + (c.releaseId ? '' : ' title="当前通道未发布，无需止血"') + '>紧急止血</button>'
+        + '<button type="button" data-act="restore-rollout"'
+        + (state.adminEnabled && canRestore ? '' : ' disabled')
+        + (canRestore ? '' : ' title="暂无可恢复的暂停前灰度"') + '>恢复暂停前灰度</button>'
+        + '</div></div>'
+        + '<div class="ch-stat"><span>自动动作</span><b>' + esc(policyText) + '</b></div>'
+        + '<div class="ch-stat"><span>样本 / 设备</span><b>' + esc((health && health.samples) || 0)
+        + ' / ' + esc((health && health.cohortSize) || 0) + '</b></div>'
+        + '<div class="ch-stat-detail">启动失败 ' + esc((health && health.badLaunches) || 0) + '/'
+        + esc((health && health.launches) || 0) + '（' + ratePct(health && health.launchFailRate) + '）'
+        + ' · 应急 ' + esc((health && health.emergency) || 0)
+        + ' · 回退 ' + esc((health && health.fallback) || 0)
+        + ' · 安装失败 ' + esc((health && health.fails) || 0) + '/'
+        + esc((health && health.attempts) || 0) + '（' + ratePct(health && health.installFailRate) + '）</div>'
+        + (health ? '<div class="ch-stat-detail">' + healthBadge(health) + '</div>' : '')
+        + (sl ? '<div class="ch-stat-detail">最近止损：' + esc(sl.action) + ' · ' + esc(fmtTime(sl.at))
+          + (sl.operator ? ' · ' + esc(sl.operator) : '')
+          + (sl.reason ? ' · ' + esc(sl.reason) : '')
+          + (sl.previousRollout ? ' · 可恢复' : '') + '</div>' : '')
+        + '</div>';
+      var running = c.running || { devices: 0, versions: [] };
+      var runningKindLabel = {
+        current: ['green', 'current'],
+        previous: ['amber', 'previous'],
+        embedded: ['gray', '内置包'],
+        other: ['red', '其他版本'],
+      };
+      var runningRows = (running.versions || []).map(function (v) {
+        var kind = runningKindLabel[v.kind] || ['gray', v.kind || '未知'];
+        return '<tr><td class="mono" title="' + escAttr(v.updateId || 'embedded') + '">'
+          + esc(v.updateId || 'embedded') + '</td>'
+          + '<td class="mono">' + esc(fmtShort(v.releaseId)) + '</td>'
+          + '<td>' + esc(v.platform === 'unknown' ? '未标记' : v.platform) + '</td>'
+          + '<td>' + esc(v.devices) + '</td>'
+          + '<td>' + esc(fmtTime(v.lastAt)) + '</td>'
+          + '<td><span class="tag ' + kind[0] + '">' + esc(kind[1]) + '</span></td></tr>';
+      }).join('');
+      var runningSection = '<div class="ch-section"><div class="ch-section-head">'
+        + '<div><h3>实际运行版本</h3><p>最近 7 天来自客户端上报的最近一次运行版本，按设备去重；与通道 current/previous 指针区分</p></div>'
+        + '<span class="tag gray">' + esc(running.devices || 0) + ' 台设备</span></div>'
+        + '<div class="table-wrap"><table><thead><tr><th>updateId</th><th>releaseId</th><th>平台</th><th>设备</th><th>最近上报</th><th>对齐</th></tr></thead><tbody>'
+        + (runningRows || '<tr><td colspan="6" class="empty">暂无客户端上报</td></tr>') + '</tbody></table></div></div>';
       // 只有异常状态才占用头部空间；「独立发布」是常态，不显示。
       var badge = c.rollback
         ? '<span class="tag red">回滚指令</span>'
@@ -296,7 +478,8 @@
 
       return '<div class="ch" data-channel="' + ch + '" id="channel-panel-' + index + '" role="tabpanel"'
         + ' aria-labelledby="channel-tab-' + index + '"' + (c.channel === activeChannel ? '' : ' hidden') + '>'
-        + '<div class="ch-head"><div class="ch-title"><b>' + esc(c.channel) + '</b>' + badge + '</div>'
+        + '<div class="ch-head"><div class="ch-title"><b>' + esc(c.channel) + '</b>' + badge
+        + (health ? ' ' + healthBadge(health) : '') + '</div>'
         + '<div class="ch-head-meta"><span class="ch-total">7 天合计：' + esc(cm.total || 0) + ' 请求 · '
         + esc(cm.uniqueUids || 0) + ' 设备 · ' + esc(cm.errors || 0) + ' 错误</span>'
         + '<span class="ch-updated">更新于 ' + esc(fmtTime(c.createdAt)) + '</span></div></div>'
@@ -310,6 +493,8 @@
         + '<div class="ch-whitelist"><label class="sr-only" for="wl-' + ch + '">' + esc(c.channel) + ' 白名单 uid</label>'
         + '<input id="wl-' + ch + '" type="text" placeholder="例如：uid1,uid2" value="' + escAttr(whitelist) + '" data-orig="' + escAttr(whitelist) + '"' + disabled + '>'
         + '<button type="button" class="primary" data-act="save-whitelist"' + disabled + '>保存白名单</button></div></div>'
+        + healthSection
+        + runningSection
         + '<div class="ch-section"><div class="ch-section-head"><div><h3>发布操作</h3><p>提升历史版本，或回滚、重新发布当前通道</p></div></div>'
         + '<div class="ch-release-actions"><div class="ch-promote"><label for="ver-' + ch + '">选择要提升的历史版本</label><div class="inline">'
         + '<select id="ver-' + ch + '"' + disabled + '><option value="">选择版本…</option>' + releaseOptions + '</select>'
@@ -448,10 +633,84 @@
   }
 
   // ---------- 渲染：Updates ----------
-  function renderUpdates() {
+  /** 把「各通道实际运行版本」汇总成 release 可查的索引（updateId / releaseId 双键）。 */
+  function buildRunningIndex() {
+    var byUpdate = {};
+    var byRelease = {};
+    function add(map, key, channelName, version) {
+      if (!key) return;
+      var entry = map[key] || (map[key] = { devices: 0, channels: {} });
+      var channel = entry.channels[channelName] || (entry.channels[channelName] = { devices: 0, kinds: {} });
+      channel.devices += version.devices || 0;
+      channel.kinds[version.kind] = (channel.kinds[version.kind] || 0) + (version.devices || 0);
+      entry.devices += version.devices || 0;
+    }
+    (state.channels || []).forEach(function (c) {
+      var running = c.running;
+      if (!running || !running.versions) return;
+      running.versions.forEach(function (v) {
+        if (v.embedded) return;
+        add(byUpdate, v.updateId, c.channel, v);
+        add(byRelease, v.releaseId, c.channel, v);
+      });
+    });
+    return function runInfoFor(release) {
+      if (!release) return null;
+      return (release.updateId && byUpdate[release.updateId]) ||
+        (release.releaseId && byRelease[release.releaseId]) ||
+        null;
+    };
+  }
+
+  function renderRunningCell(runInfo) {
+    if (!runInfo || !runInfo.devices) return '<span class="empty">未运行</span>';
+    var channelRows = Object.keys(runInfo.channels).sort().map(function (name) {
+      var entry = runInfo.channels[name];
+      var kinds = Object.keys(entry.kinds).map(function (kind) {
+        return kind + ' ' + entry.kinds[kind];
+      }).join(' / ');
+      return '<div><b>' + esc(name) + '</b> ' + esc(entry.devices) + ' 台'
+        + (kinds ? ' <span class="meta">' + esc(kinds) + '</span>' : '') + '</div>';
+    }).join('');
+    return channelRows + '<div class="meta">合计 ' + esc(runInfo.devices) + ' 台</div>';
+  }
+
+  function matchesRunningFilter(runInfo, filter) {
+    if (!filter) return true;
+    if (filter === 'running') return Boolean(runInfo && runInfo.devices);
+    if (filter === 'idle') return !runInfo || !runInfo.devices;
+    if (!runInfo) return false;
+    return Object.keys(runInfo.channels).some(function (name) {
+      return (runInfo.channels[name].kinds[filter] || 0) > 0;
+    });
+  }
+
+  function renderUpdates(options) {
     var platform = view.updates.platform;
+    var channelFilter = view.updates.channel;
+    var runFilter = view.updates.run;
+    var query = String(view.updates.query || '').trim();
+    // 空格分隔的多个关键词按 AND 组合，releaseId / updateId / 运行通道名都参与匹配。
+    var terms = query ? query.toLowerCase().split(/\s+/).filter(Boolean) : [];
+    var total = (state.releases || []).length;
+    var runInfoFor = buildRunningIndex();
     var list = (state.releases || []).filter(function (r) {
-      return !platform || (r.platforms || []).indexOf(platform) !== -1;
+      if (platform && (r.platforms || []).indexOf(platform) === -1) return false;
+      var runInfo = runInfoFor(r);
+      if (channelFilter && !(runInfo && runInfo.channels[channelFilter] && runInfo.channels[channelFilter].devices)) {
+        return false;
+      }
+      if (!matchesRunningFilter(runInfo, runFilter)) return false;
+      if (!terms.length) return true;
+      var words = [r.releaseId, r.updateId];
+      if (runInfo) {
+        Object.keys(runInfo.channels).forEach(function (name) {
+          words.push(name);
+          words = words.concat(Object.keys(runInfo.channels[name].kinds));
+        });
+      }
+      var haystack = words.join(' ').toLowerCase();
+      return terms.every(function (term) { return haystack.indexOf(term) !== -1; });
     });
 
     var size = view.updates.size;
@@ -460,6 +719,14 @@
     view.updates.page = page;
     var slice = list.slice((page - 1) * size, page * size);
 
+    // 重绘会替换输入框；先记录焦点，重绘后恢复，避免输入时被自动刷新打断。
+    var keepFocus = Boolean(options && options.keepFocus);
+    try {
+      keepFocus = keepFocus || (document.activeElement && document.activeElement.id === 'upQuery');
+    } catch (e) {
+      // 非浏览器环境（测试桩）忽略
+    }
+
     var rows = slice.map(function (r) {
       var tags = '';
       if (r.currentChannels.length) tags += '<span class="tag green">current: ' + esc(r.currentChannels.join(', ')) + '</span>';
@@ -467,6 +734,7 @@
       if (r.sameAsCurrent && !r.currentChannels.length) tags += '<span class="tag blue">与 current 同产物</span>';
       if (r.restoredFrom) tags += '<span class="tag gray">源自 ' + esc(r.restoredFrom) + '</span>';
       if (!tags) tags = '<span class="tag gray">历史</span>';
+      var runInfo = runInfoFor(r);
       return '<tr><td>' + esc(fmtTime(r.createdAt)) + '</td>'
         + '<td class="mono">' + esc(r.releaseId) + ' <button type="button" class="mini" data-copy="' + escAttr(r.releaseId) + '">复制</button></td>'
         + '<td class="mono" title="' + escAttr(r.updateId) + '">' + esc(fmtShort(r.updateId)) + '</td>'
@@ -474,8 +742,32 @@
         + '<td>' + esc(fmtBytes(r.size)) + '</td>'
         + '<td title="以此版本为目标的补丁数 / 体积">' + esc(r.patchCount || 0)
         + ' / ' + esc(fmtBytes(r.patchBytes)) + '</td>'
+        + '<td>' + renderRunningCell(runInfo) + '</td>'
         + '<td>' + tags + '</td></tr>';
     }).join('');
+
+    var channelOptions = ['<option value="">全部通道</option>'].concat(
+      (state.channels || []).map(function (c) {
+        return '<option value="' + escAttr(c.channel) + '"'
+          + (channelFilter === c.channel ? ' selected' : '') + '>' + esc(c.channel) + '</option>';
+      }),
+    ).join('');
+    var runOptions = [
+      ['', '全部运行状态'],
+      ['running', '有设备运行'],
+      ['idle', '无设备运行'],
+      ['current', '作为 current 运行'],
+      ['previous', '作为 previous 运行'],
+      ['other', '作为其他版本运行'],
+    ].map(function (pair) {
+      return '<option value="' + escAttr(pair[0]) + '"'
+        + (runFilter === pair[0] ? ' selected' : '') + '>' + esc(pair[1]) + '</option>';
+    }).join('');
+
+    var filtering = Boolean(platform || channelFilter || runFilter || terms.length);
+    var countText = filtering
+      ? '筛选后 ' + list.length + ' / ' + total + ' 条'
+      : '共 ' + total + ' 条';
 
     $('#updates').innerHTML = ''
       + '<div class="inline" style="margin-bottom:8px">'
@@ -483,16 +775,32 @@
       + PLATFORMS.map(function (p) {
         return '<option value="' + p + '"' + (platform === p ? ' selected' : '') + '>' + esc(PLATFORM_LABEL[p] || p) + '</option>';
       }).join('') + '</select>'
-      + '<span class="meta">共 ' + list.length + ' 条</span></div>'
-      + '<div class="table-wrap"><table><thead><tr><th>时间</th><th>releaseId</th><th>updateId</th><th>平台</th><th>大小</th><th>补丁</th><th>状态</th></tr></thead><tbody>'
-      + (rows || '<tr><td colspan="7" class="empty">没有匹配的版本</td></tr>') + '</tbody></table></div>'
+      + '<select id="upChannel">' + channelOptions + '</select>'
+      + '<select id="upRun">' + runOptions + '</select>'
+      + '<input id="upQuery" type="search" placeholder="搜索 releaseId / updateId / 通道（空格分隔多关键词）" value="' + escAttr(query) + '">'
+      + '<button type="button" id="upClear"' + (filtering ? '' : ' disabled') + '>重置</button>'
+      + '<span class="meta">' + countText + '</span></div>'
+      + '<div class="table-wrap"><table><thead><tr><th>时间</th><th>releaseId</th><th>updateId</th><th>平台</th><th>大小</th><th>补丁</th><th>实际运行</th><th>状态</th></tr></thead><tbody>'
+      + (rows || '<tr><td colspan="8" class="empty">没有匹配的版本</td></tr>') + '</tbody></table></div>'
       + '<div class="pager">'
       + '<button type="button" id="upPrev"' + (page <= 1 ? ' disabled' : '') + '>上一页</button>'
       + '<span>' + page + ' / ' + pages + '</span>'
       + '<button type="button" id="upNext"' + (page >= pages ? ' disabled' : '') + '>下一页</button>'
       + '</div>';
 
-    $('#updatesHint').textContent = '每次发布都会新增版本，可按 releaseId / updateId 搜索';
+    if (keepFocus) {
+      var searchInput = $('#upQuery');
+      if (searchInput && searchInput.focus) {
+        searchInput.focus();
+        var cursor = (searchInput.value || '').length;
+        if (searchInput.setSelectionRange) {
+          try { searchInput.setSelectionRange(cursor, cursor); } catch (e) { /* ignore */ }
+        }
+      }
+    }
+
+    $('#updatesHint').textContent =
+      '共 ' + total + ' 条历史版本；支持按 releaseId / updateId / 运行通道关键字搜索，并可按通道与运行状态（current / previous / 其他）筛选；「实际运行」来自客户端最近一次上报';
   }
 
   // ---------- 渲染：Events ----------
@@ -595,6 +903,9 @@
       var link = document.querySelector('#tabs a[data-tab="' + tab + '"]');
       if (link) link.classList.toggle('active', tab === name);
     });
+    // 设置页不展示全局统计卡（通道数 / 历史发布数等）。
+    var stats = $('#stats');
+    if (stats) stats.hidden = name === 'settings';
 
     if (name === 'overview') {
       renderTrend();
@@ -608,6 +919,8 @@
       renderMetricsDetail();
     } else if (name === 'events') {
       renderEvents();
+    } else if (name === 'settings') {
+      renderSettings();
     }
     renderCounts();
   }
@@ -679,12 +992,10 @@
     var t = token();
     if (!t) {
       toast('请先在「设置」中填写管理令牌', 'warn');
-      var settings = $('#settings');
-      if (settings) settings.open = true;
-      $('#token').focus();
-      return;
+      openSettings(true);
+      return false;
     }
-    if (confirmText && !window.confirm(confirmText)) return;
+    if (confirmText && !window.confirm(confirmText)) return false;
 
     var label = btn ? btn.textContent : '';
     if (btn) {
@@ -700,22 +1011,28 @@
       });
       var json = await res.json().catch(function () { return {}; });
       if (res.status === 401) {
-        // 令牌无效时直接打开设置并聚焦，避免用户只看到一句报错。
-        var settings = $('#settings');
-        if (settings) settings.open = true;
-        var input = $('#token');
-        if (input) input.focus();
+        // 令牌无效时直接打开设置页并聚焦，避免用户只看到一句报错。
+        openSettings(true);
         throw new Error('管理令牌无效：请在「设置」中填写服务启动时的 OTA_ADMIN_TOKEN，并点「保存到本机」');
       }
       if (!res.ok) throw new Error(json.error || 'HTTP ' + res.status);
-      toast(json.duplicated ? '重复提交已忽略（60 秒内相同操作）' : '操作成功，已刷新', 'ok');
+      // 服务端会返回可读结果（评估结论 / 止血摘要等），优先展示它而不是笼统的成功提示。
+      var output = String(json.output || '').replace(/\s+/g, ' ').trim();
+      var text = json.duplicated
+        ? '重复提交已忽略（60 秒内相同操作）'
+        : output
+          ? (output.length > 260 ? output.slice(0, 260) + '…' : output)
+          : '操作成功，已刷新';
+      toast(text, 'ok');
       await refresh({ silent: true });
+      return true;
     } catch (err) {
       toast('操作失败：' + err.message, 'err');
       if (btn) {
         btn.disabled = false;
         btn.textContent = label;
       }
+      return false;
     }
   }
 
@@ -784,6 +1101,26 @@
         channel: ch,
         runtimeVersion: state.runtimeVersion,
       }, '确认重新发布通道 ' + ch + ' 的当前版本（刷新时间戳）？', btn);
+    } else if (act === 'evaluate-stop-loss') {
+      // 只读评估：不改状态，用于人工复核当前口径。
+      postAction({
+        action: 'evaluate-stop-loss',
+        channel: ch,
+        runtimeVersion: state.runtimeVersion,
+      }, null, btn);
+    } else if (act === 'halt-channel') {
+      // 人工紧急止血：与自动止损同一语义，会清空白名单与平台覆盖（可恢复）。
+      postAction({
+        action: 'halt-channel',
+        channel: ch,
+        runtimeVersion: state.runtimeVersion,
+      }, '确认对通道 ' + ch + ' 紧急止血？会把灰度降为 0%，并清空白名单与平台覆盖（原配置会快照，可恢复）。', btn);
+    } else if (act === 'restore-rollout') {
+      postAction({
+        action: 'restore-rollout',
+        channel: ch,
+        runtimeVersion: state.runtimeVersion,
+      }, '确认恢复通道 ' + ch + ' 暂停前的灰度、白名单与平台覆盖？', btn);
     } else if (act === 'promote') {
       var select = $('#ver-' + ch);
       if (!select || !select.value) {
@@ -872,14 +1209,32 @@
 
     // Updates：平台筛选 + 分页
     $('#updates').addEventListener('change', function (e) {
-      if (e.target.id !== 'platform') return;
-      view.updates.platform = e.target.value;
+      if (!e.target) return;
+      if (e.target.id === 'platform') view.updates.platform = e.target.value;
+      else if (e.target.id === 'upChannel') view.updates.channel = e.target.value;
+      else if (e.target.id === 'upRun') view.updates.run = e.target.value;
+      else return;
       view.updates.page = 1;
       renderUpdates();
+    });
+    // 版本搜索：客户端即时过滤 releaseId / updateId，重绘后恢复焦点与光标。
+    $('#updates').addEventListener('input', function (e) {
+      if (!e.target || e.target.id !== 'upQuery') return;
+      view.updates.query = e.target.value === undefined ? '' : e.target.value;
+      view.updates.page = 1;
+      renderUpdates({ keepFocus: true });
     });
     $('#updates').addEventListener('click', function (e) {
       if (e.target.id === 'upPrev') { view.updates.page -= 1; renderUpdates(); }
       if (e.target.id === 'upNext') { view.updates.page += 1; renderUpdates(); }
+      if (e.target.id === 'upClear') {
+        view.updates.query = '';
+        view.updates.channel = '';
+        view.updates.run = '';
+        view.updates.platform = '';
+        view.updates.page = 1;
+        renderUpdates({ keepFocus: true });
+      }
     });
 
     // Events：服务端过滤 + 分页
@@ -924,7 +1279,7 @@
       }
     });
 
-    // 管理令牌
+    // 管理令牌（设置页）
     var tokenInput = $('#token');
     tokenInput.value = localStorage.getItem('ota_admin_token') || '';
     $('#saveToken').addEventListener('click', function () {
@@ -935,12 +1290,42 @@
       toast(value ? '令牌已保存' : '令牌为空', value ? 'ok' : 'warn');
     });
 
-    // 点击面板外部关闭设置
-    document.addEventListener('click', function (e) {
-      var settings = $('#settings');
-      if (!settings || !settings.open) return;
-      if (!settings.contains(e.target)) settings.open = false;
-    });
+    // 设置页左侧分类切换：管理令牌 / 止损设置。
+    var settingsNav = $('#settingsNav');
+    if (settingsNav) {
+      settingsNav.addEventListener('click', function (e) {
+        var btn = e.target && e.target.closest ? e.target.closest('button[data-settings-tab]') : null;
+        if (!btn) return;
+        view.settings.tab = btn.dataset.settingsTab;
+        renderSettings();
+      });
+    }
+
+    // 止损设置（设置页）：只提交改动过的字段，避免把未填的 Webhook 覆盖掉。
+    var saveStopLoss = $('#saveStopLoss');
+    if (saveStopLoss) {
+      saveStopLoss.addEventListener('click', async function () {
+        var minInput = $('#slMinSamples');
+        var webhookInput = $('#slWebhook');
+        var clearInput = $('#slWebhookClear');
+        var minRaw = minInput ? minInput.value.trim() : '';
+        var webhookRaw = webhookInput ? webhookInput.value.trim() : '';
+        var body = {
+          action: 'set-stop-loss-config',
+          runtimeVersion: state.runtimeVersion,
+        };
+        if (minRaw !== '') body.minSamples = Number(minRaw);
+        if (clearInput && clearInput.checked) body.webhook = '';
+        else if (webhookRaw !== '') body.webhook = webhookRaw;
+        var ok = await postAction(body, null, saveStopLoss);
+        saveStopLoss.disabled = false;
+        saveStopLoss.textContent = '保存止损设置';
+        if (ok) syncStopLossSettings(true);
+      });
+    }
+
+    // 首屏 hash 可能直接是 #settings，初始化时先回填一次。
+    syncStopLossSettings(false);
   }
 
   function setupTimer() {

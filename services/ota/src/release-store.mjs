@@ -322,6 +322,65 @@ export async function setRollout(
   return written;
 }
 
+/**
+ * 记录止损状态（不做发布动作；止血由 setRollout 完成）。
+ * 状态写入通道记录，供幂等/冷却判定与看板复盘；releaseId 变化后自然重新具备触发资格。
+ */
+export async function setStopLoss(runtimeVersion, channel, stopLoss) {
+  const name = normalizeChannel(channel);
+  const current = await readChannel(runtimeVersion, name);
+  if (!current) throw new Error(`通道 ${name} 不存在`);
+  const entry = auditEntry({
+    action: 'stop-loss',
+    channel: name,
+    releaseId: current.releaseId || null,
+    updateId: current.updateId || null,
+    operator: stopLoss.operator || 'stop-loss',
+    via: stopLoss.via || 'sentinel',
+    params: { mode: stopLoss.action, reason: stopLoss.reason },
+  });
+  const written = await writeChannel(runtimeVersion, name, {
+    ...current,
+    stopLoss: { ...stopLoss },
+    history: [entry, ...(current.history || [])].slice(0, MAX_HISTORY),
+  });
+  await appendAudit(runtimeVersion, entry);
+  return written;
+}
+
+/**
+ * 清除止损状态（恢复灰度后调用），并记录一条 restore-rollout 审计。
+ * 只删 stopLoss 字段，rollout 由调用方先行写回。
+ */
+export async function clearStopLoss(
+  runtimeVersion,
+  channel,
+  { operator, via, requestId, source } = {},
+) {
+  const name = normalizeChannel(channel);
+  const current = await readChannel(runtimeVersion, name);
+  if (!current) throw new Error(`通道 ${name} 不存在`);
+  const entry = auditEntry({
+    action: 'restore-rollout',
+    channel: name,
+    releaseId: current.releaseId || null,
+    updateId: current.updateId || null,
+    operator,
+    via,
+    requestId,
+    params: { hadSnapshot: Boolean(current.stopLoss?.previousRollout) },
+    source,
+  });
+  const rest = { ...current };
+  delete rest.stopLoss;
+  const written = await writeChannel(runtimeVersion, name, {
+    ...rest,
+    history: [entry, ...(current.history || [])].slice(0, MAX_HISTORY),
+  });
+  await appendAudit(runtimeVersion, entry);
+  return written;
+}
+
 export async function rollbackPrevious(runtimeVersion, channel) {
   const name = normalizeChannel(channel);
   const current = await readChannel(runtimeVersion, name);

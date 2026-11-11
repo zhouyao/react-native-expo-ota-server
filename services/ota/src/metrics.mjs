@@ -86,6 +86,11 @@ async function readEvents(runtimeVersion, since) {
   return events;
 }
 
+/** 只读导出：供止损哨兵按时间窗口取事件，避免再实现一套事件读取。 */
+export async function eventsSince(runtimeVersion, sinceMs) {
+  return readEvents(runtimeVersion, sinceMs);
+}
+
 const dayKey = (iso) => {
   const time = Date.parse(iso);
   return Number.isFinite(time)
@@ -222,6 +227,8 @@ export async function aggregateMetrics(
   const channelUids = new Map();
   // 平台 × 通道的设备去重，供通道页按平台展示「N 设备」。
   const platformChannelUids = new Map();
+  // 实际运行版本：每个设备（uid）只保留最近一次客户端上报，避免更新前后重复计入。
+  const runningUids = new Map();
 
   for (const event of events) {
     // 补丁事件走独立口径，避免改变既有 total / 错误率 / 客户端上报等统计。
@@ -251,6 +258,28 @@ export async function aggregateMetrics(
     const day = dayKey(event.at);
     const isManifest = event.type === 'manifest';
     const isAsset = event.type === 'asset';
+    // 客户端事件携带的是「当时正在运行的 updateId」，不是服务端下发的版本。
+    // 按 uid 取最近一条，得到每个设备当前实际运行的版本。
+    if (!isManifest && !isAsset && event.uid) {
+      const runningUpdateId = event.updateId || null;
+      const embedded = Boolean(event.embedded);
+      if ((runningUpdateId || embedded) && (!filter || key === filter)) {
+        const runningKey = `${channelName}\u0000${event.uid}`;
+        const at = Date.parse(event.at) || 0;
+        const previous = runningUids.get(runningKey);
+        if (!previous || at >= previous.at) {
+          runningUids.set(runningKey, {
+            channel: channelName,
+            uid: event.uid,
+            at,
+            updateId: runningUpdateId,
+            releaseId: event.releaseId || null,
+            platform: key,
+            embedded,
+          });
+        }
+      }
+    }
 
     // 平台分组基于全量事件。
     group.total += 1;
@@ -338,6 +367,51 @@ export async function aggregateMetrics(
     if (entry) entry.uniqueUids = set.size;
   }
 
+  // 汇总实际运行版本：channel → 设备数 + 版本分布（按设备数降序）。
+  const runningChannels = new Map();
+  for (const entry of runningUids.values()) {
+    let bucket = runningChannels.get(entry.channel);
+    if (!bucket) {
+      bucket = { devices: 0, versions: new Map() };
+      runningChannels.set(entry.channel, bucket);
+    }
+    bucket.devices += 1;
+    const versionKey = `${entry.platform}\u0000${entry.embedded ? 'embedded' : entry.updateId || ''}`;
+    let version = bucket.versions.get(versionKey);
+    if (!version) {
+      version = {
+        updateId: entry.updateId,
+        releaseId: entry.releaseId,
+        platform: entry.platform,
+        embedded: entry.embedded,
+        devices: 0,
+        lastAtMs: entry.at,
+      };
+      bucket.versions.set(versionKey, version);
+    }
+    version.devices += 1;
+    if (entry.at >= version.lastAtMs) {
+      version.lastAtMs = entry.at;
+      if (entry.releaseId) version.releaseId = entry.releaseId;
+    }
+  }
+  const running = { byChannel: {} };
+  for (const [name, bucket] of runningChannels) {
+    running.byChannel[name] = {
+      devices: bucket.devices,
+      versions: [...bucket.versions.values()]
+        .sort((a, b) => b.devices - a.devices)
+        .map((version) => ({
+          updateId: version.updateId,
+          releaseId: version.releaseId,
+          platform: version.platform,
+          embedded: version.embedded,
+          devices: version.devices,
+          lastAt: new Date(version.lastAtMs).toISOString(),
+        })),
+    };
+  }
+
   return {
     windowDays: days,
     platform: filter,
@@ -353,6 +427,7 @@ export async function aggregateMetrics(
     byStatus,
     byDay: dayEntries(byDay),
     versions,
+    running,
     patch: {
       ...patchRates(patch),
       reasons: patch.reasons,

@@ -40,6 +40,7 @@ function runDashboard(missingSelectors = [], options = {}) {
   const fetchCalls = [];
   const replacedUrls = [];
   const savedTokens = [];
+  const toastTexts = [];
   const bootState = { ...BOOT_STATE, ...(options.state || {}) };
   const NativeDate = Date;
   let clockOffset = 0;
@@ -86,7 +87,12 @@ function runDashboard(missingSelectors = [], options = {}) {
         calls.push({ selector: 'document', type, handler });
       },
       createElement() {
-        return { className: '', textContent: '', remove() {} };
+        const el = { className: '', _text: '', remove() {} };
+        Object.defineProperty(el, 'textContent', {
+          get() { return el._text; },
+          set(value) { el._text = String(value); toastTexts.push(String(value)); },
+        });
+        return el;
       },
       hidden: false,
     },
@@ -116,8 +122,16 @@ function runDashboard(missingSelectors = [], options = {}) {
     clearInterval() {},
     fetch(url) {
       fetchCalls.push(url);
+      if (url === '/api/admin/actions') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve(options.actionResponse || { ok: true, output: '操作成功' }),
+        });
+      }
       return Promise.resolve({
         ok: true,
+        status: 200,
         json: () => Promise.resolve(bootState),
       });
     },
@@ -131,6 +145,7 @@ function runDashboard(missingSelectors = [], options = {}) {
     fetchCalls,
     replacedUrls,
     savedTokens,
+    toastTexts,
     getElement: querySelector,
     setHash: (hash) => { context.location.hash = hash; },
     advance: (ms) => { clockOffset += ms; },
@@ -483,4 +498,261 @@ test('保存管理令牌会去掉首尾空格，避免被服务端判为无效',
   assert.equal(savedTokens.length, 1);
   assert.equal(savedTokens[0].value, 'dev-token');
   assert.equal(getElement('#token').value, 'dev-token');
+});
+
+test('版本页支持按 releaseId / updateId 即时搜索并可清除', () => {
+  const now = new Date().toISOString();
+  const releases = [
+    { releaseId: '1111', updateId: 'aaaa-1111', createdAt: now, platforms: ['ios'], currentChannels: [], previousChannels: [], size: 1, patchCount: 0, patchBytes: 0 },
+    { releaseId: '2222', updateId: 'bbbb-2222', createdAt: now, platforms: ['android'], currentChannels: [], previousChannels: [], size: 1, patchCount: 0, patchBytes: 0 },
+    { releaseId: '3333', updateId: 'aaaa-3333', createdAt: now, platforms: ['ios'], currentChannels: [], previousChannels: [], size: 1, patchCount: 0, patchBytes: 0 },
+  ];
+  const { calls, elements } = runDashboard([], { hash: '#updates', state: { releases } });
+  const html = () => elements.get('#updates').innerHTML;
+  const input = calls.find((call) => call.selector === '#updates' && call.type === 'input');
+  assert.ok(input, '版本页应绑定搜索输入');
+  assert.ok(html().includes('id="upQuery"'), '应渲染搜索框');
+  assert.ok(
+    elements.get('#updatesHint').textContent.includes('releaseId / updateId'),
+    '提示文案应准确说明可搜索',
+  );
+
+  input.handler({ target: { id: 'upQuery', value: '2222' } });
+  assert.ok(html().includes('data-copy="2222"'), 'releaseId 命中');
+  assert.ok(!html().includes('data-copy="1111"'), '非命中 releaseId 应被过滤');
+  assert.ok(html().includes('筛选后 1 / 3 条'));
+
+  input.handler({ target: { id: 'upQuery', value: 'aaaa' } });
+  assert.ok(html().includes('data-copy="1111"') && html().includes('data-copy="3333"'), 'updateId 命中');
+  assert.ok(!html().includes('data-copy="2222"'), '非命中 updateId 应被过滤');
+
+  const click = calls.find((call) => call.selector === '#updates' && call.type === 'click');
+  click.handler({ target: { id: 'upClear' } });
+  assert.ok(
+    html().includes('data-copy="1111"') &&
+      html().includes('data-copy="2222"') &&
+      html().includes('data-copy="3333"'),
+    '清除后应恢复全部版本',
+  );
+  assert.ok(!html().includes('筛选后'), '清除后不再显示筛选计数');
+});
+
+test('通道页展示设备实际运行版本并与指针区分', () => {
+  const now = new Date().toISOString();
+  const { elements } = runDashboard([], {
+    hash: '#channels',
+    state: {
+      channels: [{
+        channel: 'beta',
+        releaseId: 'r2',
+        updateId: 'u2',
+        createdAt: now,
+        previous: { releaseId: 'r1', updateId: 'u1' },
+        rollout: { percentage: 100 },
+        running: {
+          devices: 3,
+          versions: [
+            { updateId: 'u2', releaseId: 'r2', platform: 'android', devices: 2, lastAt: now, kind: 'current' },
+            { updateId: 'u1', releaseId: 'r1', platform: 'ios', devices: 1, lastAt: now, kind: 'previous' },
+          ],
+        },
+        metrics: { total: 3, uniqueUids: 3, errors: 0, current: 3, previous: 0, whitelist: 0 },
+      }],
+    },
+  });
+  const html = elements.get('#channels').innerHTML;
+  assert.ok(html.includes('<h3>实际运行版本</h3>'));
+  assert.ok(html.includes('3 台设备'));
+  assert.ok(html.includes('>u2<') && html.includes('>u1<'));
+  assert.ok(html.includes('>current<') && html.includes('>previous<'));
+  assert.ok(html.includes('来自客户端上报'));
+});
+
+test('概览通道表展示实际运行 top 版本', () => {
+  const now = new Date().toISOString();
+  const { elements } = runDashboard([], {
+    hash: '#overview',
+    state: {
+      channels: [{
+        channel: 'beta',
+        releaseId: 'r2',
+        updateId: 'u2',
+        rollout: { percentage: 100 },
+        metrics: { total: 4, errors: 0 },
+        running: {
+          devices: 2,
+          versions: [{
+            updateId: 'abcdefgh-9999',
+            releaseId: 'r2',
+            platform: 'android',
+            devices: 2,
+            lastAt: now,
+            kind: 'current',
+          }],
+        },
+      }],
+    },
+  });
+  const html = elements.get('#overviewChannels').innerHTML;
+  assert.ok(html.includes('<th>实际运行</th>'));
+  assert.ok(html.includes('abcdefgh'), '展示 top 版本短 id');
+  assert.ok(html.includes('2 台'));
+  assert.ok(html.includes('>current<'));
+});
+
+test('版本页展示各通道实际运行版本并支持通道/状态筛选', () => {
+  const now = new Date().toISOString();
+  const state = {
+    channels: [
+      {
+        channel: 'canary',
+        running: {
+          devices: 3,
+          versions: [
+            { updateId: 'u-new', releaseId: 'r2', platform: 'android', devices: 2, lastAt: now, kind: 'current' },
+            { updateId: 'u-old', releaseId: 'r1', platform: 'ios', devices: 1, lastAt: now, kind: 'other' },
+          ],
+        },
+      },
+      {
+        channel: 'production',
+        running: {
+          devices: 1,
+          versions: [
+            { updateId: 'u-old', releaseId: 'r1', platform: 'android', devices: 1, lastAt: now, kind: 'other' },
+          ],
+        },
+      },
+    ],
+    releases: [
+      { releaseId: 'r2', updateId: 'u-new', createdAt: now, platforms: ['android'], currentChannels: ['canary'], previousChannels: [], size: 1, patchCount: 0, patchBytes: 0 },
+      { releaseId: 'r1', updateId: 'u-old', createdAt: now, platforms: ['ios'], currentChannels: [], previousChannels: [], size: 1, patchCount: 0, patchBytes: 0 },
+    ],
+  };
+  const { calls, elements } = runDashboard([], { hash: '#updates', state });
+  const html = () => elements.get('#updates').innerHTML;
+  assert.ok(html().includes('<th>实际运行</th>'));
+  assert.ok(html().includes('<b>canary</b> 2 台'), 'r2 在 canary 实际运行 2 台');
+  assert.ok(html().includes('<b>production</b> 1 台'), 'r1 在 production 实际运行 1 台');
+  assert.ok(html().includes('<b>canary</b> 1 台'), 'r1 在 canary 实际运行 1 台');
+
+  const change = calls.find((call) => call.selector === '#updates' && call.type === 'change');
+  change.handler({ target: { id: 'upChannel', value: 'production' } });
+  assert.ok(html().includes('data-copy="r1"'));
+  assert.ok(!html().includes('data-copy="r2"'), '按运行通道过滤');
+
+  change.handler({ target: { id: 'upChannel', value: '' } });
+  change.handler({ target: { id: 'upRun', value: 'current' } });
+  assert.ok(html().includes('data-copy="r2"'));
+  assert.ok(!html().includes('data-copy="r1"'), '按运行状态过滤');
+
+  const input = calls.find((call) => call.selector === '#updates' && call.type === 'input');
+  change.handler({ target: { id: 'upRun', value: '' } });
+  input.handler({ target: { id: 'upQuery', value: 'production' } });
+  assert.ok(html().includes('data-copy="r1"'), '关键词可匹配运行通道名');
+  assert.ok(!html().includes('data-copy="r2"'));
+});
+
+test('版本搜索与平台筛选可组合', () => {
+  const now = new Date().toISOString();
+  const releases = [
+    { releaseId: 'r-ios', updateId: 'u-ios', createdAt: now, platforms: ['ios'], currentChannels: [], previousChannels: [], size: 1, patchCount: 0, patchBytes: 0 },
+    { releaseId: 'r-and', updateId: 'u-and', createdAt: now, platforms: ['android'], currentChannels: [], previousChannels: [], size: 1, patchCount: 0, patchBytes: 0 },
+  ];
+  const { calls, elements } = runDashboard([], { hash: '#updates', state: { releases } });
+  const html = () => elements.get('#updates').innerHTML;
+  const change = calls.find((call) => call.selector === '#updates' && call.type === 'change');
+  const input = calls.find((call) => call.selector === '#updates' && call.type === 'input');
+
+  change.handler({ target: { id: 'platform', value: 'ios' } });
+  assert.ok(html().includes('data-copy="r-ios"'));
+  assert.ok(!html().includes('data-copy="r-and"'), '平台筛选应生效');
+
+  input.handler({ target: { id: 'upQuery', value: 'r-and' } });
+  assert.ok(!html().includes('data-copy="r-ios"'), '平台与关键字应同时生效');
+  assert.ok(!html().includes('data-copy="r-and"'), 'android 版本不应出现在 ios 筛选下');
+  assert.ok(html().includes('筛选后 0 / 2 条'));
+});
+
+test('设置页可直达，展示止损策略并能提交止损设置', async () => {
+  const { calls, elements, getElement, fetchCalls } = runDashboard([], {
+    hash: '#settings',
+    state: {
+      adminEnabled: true,
+      runtimeVersion: '1',
+      stopLoss: {
+        enabled: true,
+        mode: 'monitor',
+        minSamples: 20,
+        webhookConfigured: true,
+        webhookOrigin: 'https://hook.example',
+        overridden: { minSamples: false, webhook: false },
+      },
+    },
+  });
+
+  const save = calls.find(
+    (call) => call.selector === '#saveStopLoss' && call.type === 'click',
+  );
+  assert.ok(save, '设置页应绑定止损保存');
+  assert.ok(
+    elements.get('#slSource').textContent.includes('仅监控'),
+    '应展示当前策略',
+  );
+  assert.ok(
+    elements.get('#stopLossHint').textContent.includes('MIN_SAMPLES=20'),
+    '应展示当前最小样本数',
+  );
+
+  getElement('#token').value = 'dev-token';
+  getElement('#slMinSamples').value = '5';
+  getElement('#slWebhook').value = 'https://hook.example/new';
+  getElement('#slWebhookClear').checked = false;
+
+  await save.handler({ target: {} });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.ok(fetchCalls.includes('/api/admin/actions'), '应发起写请求');
+});
+
+test('立即评估会把服务端 output 显示在提示里', async () => {
+  const output =
+    '通道 beta 止损评估：healthy（insufficient-samples） · 自动动作：仅监控（只告警）';
+  const { calls, getElement, toastTexts } = runDashboard([], {
+    hash: '#channels',
+    state: {
+      adminEnabled: true,
+      runtimeVersion: '1',
+      channels: [
+        {
+          channel: 'beta',
+          releaseId: 'r2',
+          updateId: 'u2',
+          rollout: { percentage: 100 },
+          health: {
+            enabled: true,
+            mode: 'monitor',
+            verdict: 'healthy',
+            reason: 'insufficient-samples',
+            samples: 0,
+            cohortSize: 0,
+          },
+        },
+      ],
+    },
+    actionResponse: { ok: true, output },
+  });
+
+  getElement('#token').value = 'dev-token';
+  const click = calls.find((call) => call.selector === '#channels' && call.type === 'click');
+  const card = { dataset: { channel: 'beta' } };
+  const button = { dataset: { act: 'evaluate-stop-loss' }, closest: () => card };
+
+  await click.handler({ target: { closest: () => button } });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.ok(
+    toastTexts.some((text) => text.includes('止损评估') && text.includes('仅监控')),
+    '应展示服务端返回的评估结果',
+  );
 });

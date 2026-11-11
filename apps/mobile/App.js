@@ -14,7 +14,8 @@ import {
   applyDownloadedUpdate,
   buildChannel as BUILD_CHANNEL,
   checkAndApplyUpdate,
-  reportEvent,
+  rememberPendingUpdate,
+  reportLaunchOutcome,
   switchChannel,
 } from './src/update';
 import Header from './src/components/Header';
@@ -108,6 +109,7 @@ function Console() {
     isUpdateAvailable,
     isUpdatePending,
     downloadProgress,
+    downloadedUpdate,
   } = Updates.useUpdates();
   const [message, setMessage] = useState('');
   const [uid, setUid] = useState('初始化中…');
@@ -143,12 +145,20 @@ function Console() {
       } catch {
         if (active) setUid('不可用');
       }
-      void reportEvent({ type: 'launch', status: 200 });
+      void reportLaunchOutcome();
     })();
     return () => {
       active = false;
     };
   }, []);
+
+  // 自动下载（checkAutomatically=ON_LOAD）不经过 downloadUpdate()，
+  // 这里监听 useUpdates 暴露的 downloadedUpdate，把待应用版本持久化，
+  // 供下次启动判断是否发生了坏包回退。
+  useEffect(() => {
+    const id = downloadedUpdate?.updateId;
+    if (id) void rememberPendingUpdate(id);
+  }, [downloadedUpdate?.updateId]);
 
   // 首屏渲染后记录一次启动耗时（bundle 开始 → 这里），并上报 client-metric。
   useEffect(() => {

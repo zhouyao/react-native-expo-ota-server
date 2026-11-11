@@ -2,7 +2,28 @@
   "name": "react-native-expo-ota-server",
   "version": "1.0.0",
   "description": "Self-hosted Expo Updates v1 server for React Native apps on iOS and Android",
+  "license": "MIT",
   "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhouyao/react-native-expo-ota-server.git"
+  },
+  "homepage": "https://github.com/zhouyao/react-native-expo-ota-server#readme",
+  "bugs": {
+    "url": "https://github.com/zhouyao/react-native-expo-ota-server/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "expo",
+    "expo-updates",
+    "ota",
+    "react-native",
+    "self-hosted",
+    "bsdiff",
+    "code-signing"
+  ],
   "type": "module",
   "scripts": {
     "ota:start": "node services/ota/src/server.mjs",

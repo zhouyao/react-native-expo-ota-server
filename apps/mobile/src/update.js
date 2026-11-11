@@ -34,7 +34,10 @@ function apiOrigin() {
     lastManifest?.launchAsset?.url ||
     Updates.manifest?.launchAsset?.url ||
     lastManifest?.extra?.expoConfig?.updates?.url ||
-    Updates.manifest?.extra?.expoConfig?.updates?.url;
+    Updates.manifest?.extra?.expoConfig?.updates?.url ||
+    // 应急启动（回退内置包）时 manifest 为空，且进程刚重启、lastManifest 也为空。
+    // 不回退到构建期 URL 的话，isEmergencyLaunch 这条最关键止损信号永远传不上去。
+    buildUpdateUrl;
   if (!url) return null;
   try {
     return new URL(url).origin;
@@ -44,7 +47,7 @@ function apiOrigin() {
 }
 
 /** 上报 check / download / apply 结果，供服务端统计采用率与失败率。 */
-export async function reportEvent({ type, status = 0, message }) {
+export async function reportEvent({ type, status = 0, message, extra }) {
   const origin = apiOrigin();
   if (!origin) return;
   try {
@@ -57,11 +60,69 @@ export async function reportEvent({ type, status = 0, message }) {
         message: message ? String(message).slice(0, 300) : undefined,
         uid: await currentUid(),
         ...runtimeInfo(),
+        ...(extra || {}),
       }),
     });
   } catch {
     // 监控是旁路，失败不影响更新
   }
+}
+
+// 持久化「即将应用」的 updateId。expo-updates 的 ExtraParams 存在本地库里，
+// 坏包启动失败回退后依然可读，因此可以用它对比下次实际运行的版本。
+const PENDING_UPDATE_PARAM = 'ota_pending_update';
+
+export async function rememberPendingUpdate(updateId) {
+  if (!updateId || !Updates.isEnabled) return;
+  try {
+    await Updates.setExtraParamAsync(PENDING_UPDATE_PARAM, String(updateId));
+  } catch {
+    // 旁路
+  }
+}
+
+async function readPendingUpdate() {
+  if (!Updates.isEnabled) return null;
+  try {
+    const params = await Updates.getExtraParamsAsync();
+    return params?.[PENDING_UPDATE_PARAM] || null;
+  } catch {
+    return null;
+  }
+}
+
+async function clearPendingUpdate() {
+  try {
+    await Updates.setExtraParamAsync(PENDING_UPDATE_PARAM, null);
+  } catch {
+    // 旁路
+  }
+}
+
+/**
+ * 启动结果上报：对比「上次下载的 updateId」与「本次实际运行的 updateId」。
+ *
+ * isEmergencyLaunch 只覆盖更新目录 / 数据库故障；坏 JS bundle 会被 expo-updates
+ * 的 ErrorRecovery 回退到旧包或内置包，该标志不会置位。因此必须用这个 watchdog
+ * 才能把「下载了 X 但实际跑的不是 X」识别为坏包回退并上报给服务端。
+ */
+export async function reportLaunchOutcome() {
+  const pending = await readPendingUpdate();
+  const actual = Updates.updateId || null;
+  const embedded = Boolean(Updates.isEmbeddedLaunch);
+  const same =
+    Boolean(pending) &&
+    Boolean(actual) &&
+    String(pending).toLowerCase() === String(actual).toLowerCase();
+  const fallback = Boolean(pending) && (embedded || !same);
+  await reportEvent({
+    type: 'launch',
+    status: fallback ? 500 : 200,
+    message: fallback ? `fallback from ${pending}` : undefined,
+    extra: pending ? { expectedUpdateId: pending, fallback } : {},
+  });
+  // 每次启动只判定一次；后续是否再次回退取决于是否又下载了新的坏包。
+  if (pending) await clearPendingUpdate();
 }
 
 export async function checkForUpdate() {
@@ -91,6 +152,10 @@ export async function downloadUpdate() {
     const result = await Updates.fetchUpdateAsync();
     if (result.manifest) lastManifest = result.manifest;
     const downloaded = Boolean(result.isNew || result.isRollBackToEmbedded);
+    if (downloaded && result.manifest?.id) {
+      // 记录待应用版本；下次启动对比实际运行的 updateId 判断是否回退。
+      await rememberPendingUpdate(result.manifest.id);
+    }
     void reportEvent({ type: 'download', status: downloaded ? 200 : 204 });
     return {
       downloaded,

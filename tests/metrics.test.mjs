@@ -185,3 +185,44 @@ test('全局 platform 收敛指标，eventsPlatform 优先于它过滤事件', a
   assert.equal(mixed.metrics.total, 3, '指标仍按全局 platform 收敛');
   assert.ok(mixed.events.every((event) => event.platform === 'android'));
 });
+
+test('实际运行版本按设备最近一次客户端上报聚合', async () => {
+  const rv = 'running-rv';
+  const t1 = new Date(Date.now() - 30000).toISOString();
+  const t2 = new Date(Date.now() - 10000).toISOString();
+  await recordEvent(rv, {
+    at: t1, type: 'client-check', channel: 'beta', status: 200,
+    uid: 'd1', updateId: 'old-up', releaseId: 'r-old', platform: 'android',
+  });
+  await recordEvent(rv, {
+    at: t2, type: 'client-launch', channel: 'beta', status: 200,
+    uid: 'd1', updateId: 'new-up', releaseId: 'r-new', platform: 'android',
+  });
+  await recordEvent(rv, {
+    at: t2, type: 'client-launch', channel: 'beta', status: 200,
+    uid: 'd2', updateId: 'new-up', releaseId: 'r-new', platform: 'android',
+  });
+  await recordEvent(rv, {
+    at: t2, type: 'client-launch', channel: 'beta', status: 500,
+    uid: 'd3', embedded: true, platform: 'ios',
+  });
+  await recordEvent(rv, {
+    at: t2, type: 'client-launch', channel: 'canary', status: 200,
+    uid: 'd4', updateId: 'canary-up', releaseId: 'r-c', platform: 'ios',
+  });
+
+  const m = await aggregateMetrics(rv, { days: 7 });
+  const beta = m.running.byChannel.beta;
+  assert.equal(beta.devices, 3, '同一设备只按最近一次上报计入');
+  assert.equal(beta.versions.length, 2);
+  assert.equal(beta.versions[0].updateId, 'new-up');
+  assert.equal(beta.versions[0].releaseId, 'r-new');
+  assert.equal(beta.versions[0].devices, 2, 'd1 的旧版本不应重复计入');
+  assert.equal(beta.versions[1].embedded, true);
+  assert.equal(beta.versions[1].devices, 1);
+  assert.equal(m.running.byChannel.canary.devices, 1);
+
+  const ios = await aggregateMetrics(rv, { days: 7, platform: 'ios' });
+  assert.equal(ios.running.byChannel.beta.devices, 1, '平台筛选同样作用于运行版本');
+  assert.equal(ios.running.byChannel.canary.devices, 1);
+});

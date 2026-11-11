@@ -1,8 +1,15 @@
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ADMIN_TOKENS } from './config.mjs';
 import {
+  ADMIN_TOKENS,
+  hasScope,
+  stopLossConfig,
+  writeStopLossOverride,
+} from './config.mjs';
+import {
+  appendAudit,
+  auditEntry,
   channelLockFile,
   listReleaseIds,
   normalizeChannel,
@@ -15,6 +22,7 @@ import {
   rememberRequest,
   withLock,
 } from './locks.mjs';
+import { applyHalt, evaluateChannelHealth, restoreRollout } from './stop-loss.mjs';
 
 // services/ota/src → 项目根需要上三级。
 const PROJECT_ROOT = path.resolve(
@@ -32,16 +40,50 @@ function providedToken(req) {
   return String(req.headers['x-ota-admin-token'] || bearer || '').trim();
 }
 
-/** 令牌 → 操作人标签（OTA_ADMIN_TOKENS 的冒号前缀）；无效返回 null。 */
-export function resolveOperator(req) {
+/** 令牌 → { label, scopes }；无效返回 null。兼容历史字符串值。 */
+export function resolveAdmin(req) {
   const token = providedToken(req);
   if (!token) return null;
-  return ADMIN_TOKENS.get(token) || null;
+  const entry = ADMIN_TOKENS.get(token);
+  if (!entry) return null;
+  return typeof entry === 'string' ? { label: entry, scopes: null } : entry;
+}
+
+/** 令牌 → 操作人标签（OTA_ADMIN_TOKENS 的冒号前缀）；无效返回 null。 */
+export function resolveOperator(req) {
+  const admin = resolveAdmin(req);
+  return admin ? admin.label : null;
 }
 
 /** 令牌未配置时恒为 false。 */
 export function isAuthorized(req) {
-  return Boolean(resolveOperator(req));
+  return Boolean(resolveAdmin(req));
+}
+
+/**
+ * 动作 → 所需权限位。未列出的动作（evaluate-stop-loss）不需要 scope。
+ * 止血 / 恢复只要求 stop-loss，便于给 on-call 一个「能止血但不能发布」的窄令牌。
+ */
+const ACTION_SCOPES = {
+  'set-rollout': 'rollout',
+  promote: 'release',
+  switch: 'release',
+  'rollback-previous': 'release',
+  republish: 'release',
+  'halt-channel': 'stop-loss',
+  'restore-rollout': 'stop-loss',
+  'set-stop-loss-config': 'stop-loss',
+};
+
+export function requiredScope(action) {
+  return ACTION_SCOPES[String(action || '')] || null;
+}
+
+/** 该 admin 是否有权执行某动作；只读评估恒为 true。 */
+export function canPerform(admin, action) {
+  const scope = requiredScope(action);
+  if (!scope) return Boolean(admin);
+  return hasScope(admin, scope);
 }
 
 /** 复用已验证的 CLI 逻辑，避免看板与命令行出现两套发布/回滚实现。 */
@@ -57,6 +99,42 @@ function runPublish(args) {
     throw new Error(detail.slice(-800) || `发布脚本退出码 ${result.status}`);
   }
   return (result.stdout || '').trim();
+}
+
+/**
+ * 全局止损设置（MIN_SAMPLES / Webhook）。不针对具体通道，因此不占通道锁；
+ * 写入运行时覆盖文件并记录审计（Webhook 只记 configured/none，不落明文）。
+ */
+async function saveStopLossSettings(input, { operator, via, requestId, source, rv }) {
+  if (requestId) {
+    const cached = recallRequest(`req:${requestId}`);
+    if (cached) return { ...cached, duplicated: true };
+  }
+  await writeStopLossOverride(
+    { minSamples: input.minSamples, webhook: input.webhook },
+    { operator },
+  );
+  const cfg = stopLossConfig();
+  const entry = auditEntry({
+    action: 'set-stop-loss-config',
+    channel: 'system',
+    operator,
+    via,
+    requestId,
+    params: {
+      minSamples: cfg.minSamples,
+      webhook: cfg.webhook ? 'configured' : 'none',
+    },
+    source,
+  });
+  if (rv) await appendAudit(rv, entry);
+  const result = {
+    message: `止损设置已更新：MIN_SAMPLES=${cfg.minSamples}，Webhook ${cfg.webhook ? '已配置' : '未配置'}`,
+    operator,
+    duplicated: false,
+  };
+  if (requestId) rememberRequest(`req:${requestId}`, result);
+  return result;
 }
 
 /** 平台灰度覆盖：对象只保留 ios / android，null 表示清除覆盖。 */
@@ -107,6 +185,12 @@ export async function performAdminAction(input, context = {}) {
 
   const rv = String(input.runtimeVersion || '');
   if (!rv) throw new Error('缺少 runtimeVersion');
+
+  // 全局设置不针对通道，提前返回，避免占用通道锁。
+  if (input.action === 'set-stop-loss-config') {
+    return saveStopLossSettings(input, { operator, via, requestId, source, rv });
+  }
+
   const name = normalizeChannel(input.channel);
   const publishArgs = (extra) => [
     ...extra,
@@ -129,12 +213,17 @@ export async function performAdminAction(input, context = {}) {
   });
   const requestKey = requestId ? `req:${requestId}` : null;
   const fingerprintKey = `fp:${fingerprint}`;
+  // 只读评估不写状态；止血 / 恢复属于应急动作，允许 60 秒内重复触发（后端幂等保护），
+  // 因此都不走「相同操作已执行」的指纹拦截。
+  const readOnly = input.action === 'evaluate-stop-loss';
+  const skipFingerprint =
+    readOnly || input.action === 'halt-channel' || input.action === 'restore-rollout';
 
   if (requestKey) {
     const cached = recallRequest(requestKey);
     if (cached) return { ...cached, duplicated: true };
   }
-  if (recallRequest(fingerprintKey)) {
+  if (!skipFingerprint && recallRequest(fingerprintKey)) {
     throw new Error('相同操作在 60 秒内已执行，请勿重复提交');
   }
 
@@ -180,12 +269,70 @@ export async function performAdminAction(input, context = {}) {
       const current = await readChannel(rv, name);
       if (!current?.releaseId) throw new Error(`通道 ${name} 尚未发布任何版本`);
       message = runPublish(publishArgs(['--touch']));
+    } else if (input.action === 'evaluate-stop-loss') {
+      // 只读评估，不改状态：便于人工在看板上先看口径再决定是否恢复。
+      const health = await evaluateChannelHealth(rv, name);
+      const policy = !health.enabled
+        ? '已关闭（仅展示健康度）'
+        : health.mode === 'monitor'
+          ? '仅监控（只告警）'
+          : health.mode === 'rollback'
+            ? '自动止血并标记待回滚'
+            : health.mode === 'halt'
+              ? '自动止血'
+              : '未知';
+      const minSamples = Number(health.minSamples || 0);
+      let sampleNote = '';
+      if (health.reason === 'insufficient-samples' && minSamples > 0) {
+        const launchGap = Math.max(0, minSamples - Number(health.launches || 0));
+        const installGap = Math.max(0, minSamples - Number(health.attempts || 0));
+        sampleNote =
+          ` · 样本不足：启动 ${health.launches ?? 0}/${minSamples}（还差 ${launchGap}）` +
+          `、安装 ${health.attempts ?? 0}/${minSamples}（还差 ${installGap}）`;
+      }
+      message =
+        `通道 ${name} 止损评估：${health.verdict}` +
+        (health.reason ? `（${health.reason}）` : '') +
+        ` · 自动动作：${policy}` +
+        ` · cohort ${health.cohortSize ?? 0} 设备` +
+        ` · 启动失败 ${health.badLaunches ?? 0}/${health.launches ?? 0}` +
+        `（应急 ${health.emergency ?? 0} / 回退 ${health.fallback ?? 0}）` +
+        ` · 安装失败 ${health.fails ?? 0}/${health.attempts ?? 0}` +
+        sampleNote;
+    } else if (input.action === 'halt-channel') {
+      // 人工紧急止血：复用哨兵的 halt 语义（清零灰度 + 清白名单/平台覆盖 + 快照）。
+      // 注意：此处已持有通道锁，applyHalt 内部不得再加锁（否则死锁）。
+      const current = await readChannel(rv, name);
+      if (!current?.releaseId) throw new Error(`通道 ${name} 尚未发布任何版本`);
+      const halted = await applyHalt(rv, name, {
+        reason: input.reason ? String(input.reason).slice(0, 200) : 'manual-halt',
+        operator,
+        via,
+        requestId,
+        action: 'halt',
+        requestedMode: input.mode ? String(input.mode).slice(0, 20) : null,
+      });
+      if (halted.action === 'skipped' && halted.reason === 'already-halted') {
+        message = `通道 ${name} 已处于止血状态（灰度 0%），未重复快照`;
+      } else if (halted.action === 'skipped') {
+        message = `通道 ${name} 未止血：${halted.reason}`;
+      } else {
+        message =
+          `通道 ${name} 已紧急止血：灰度 0%，白名单与平台覆盖已清空` +
+          `（原配置已快照，可点「恢复暂停前灰度」还原）`;
+      }
+    } else if (input.action === 'restore-rollout') {
+      const restored = await restoreRollout(rv, name, { operator, via, requestId });
+      message =
+        `通道 ${name} 已恢复暂停前灰度：${restored.percentage}%` +
+        `，白名单 ${restored.whitelist} 个` +
+        (restored.byPlatform ? `，平台覆盖 ${describeByPlatform(restored.byPlatform)}` : '');
     } else {
       throw new Error(`未知操作: ${String(input.action || '(空)')}`);
     }
 
     const result = { message, operator, duplicated: false };
-    rememberRequest(fingerprintKey, result);
+    if (!skipFingerprint) rememberRequest(fingerprintKey, result);
     if (requestKey) rememberRequest(requestKey, result);
     return result;
   });

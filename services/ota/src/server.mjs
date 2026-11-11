@@ -10,8 +10,10 @@ import {
   PUBLIC_BASE_URL,
   UPDATES_DIR,
   assertServiceConfig,
+  hasScope,
+  stopLossConfig,
 } from './config.mjs';
-import { performAdminAction, resolveOperator } from './admin.mjs';
+import { performAdminAction, requiredScope, resolveAdmin } from './admin.mjs';
 import { serveAsset } from './assets.mjs';
 import { buildManifestResponse, resolveChannel } from './manifest.mjs';
 import { listChannels, readAudit, readChannel } from './release-store.mjs';
@@ -227,14 +229,15 @@ export async function handle(req, res) {
           body: JSON.stringify({ error: '未配置 OTA_ADMIN_TOKEN，写操作已禁用' }),
         });
       }
-      const operator = resolveOperator(req);
-      if (!operator) {
+      const admin = resolveAdmin(req);
+      if (!admin) {
         return send(res, {
           status: 401,
           headers: jsonHeaders,
           body: JSON.stringify({ error: '管理令牌无效' }),
         });
       }
+      const operator = admin.label;
       let payload;
       try {
         payload = await readJsonBody(req);
@@ -243,6 +246,15 @@ export async function handle(req, res) {
           status: 400,
           headers: jsonHeaders,
           body: JSON.stringify({ error: `请求体无效: ${error.message}` }),
+        });
+      }
+      // 权限位：止血 / 恢复只需 stop-loss，可给 on-call 一个「能止血不能发布」的窄令牌。
+      const scope = requiredScope(payload.action);
+      if (scope && !hasScope(admin, scope)) {
+        return send(res, {
+          status: 403,
+          headers: jsonHeaders,
+          body: JSON.stringify({ error: `当前令牌缺少 ${scope} 权限` }),
         });
       }
       const requestId =
@@ -261,6 +273,10 @@ export async function handle(req, res) {
             percentage: payload.percentage,
             whitelist: payload.whitelist,
             byPlatform: payload.byPlatform,
+            reason: payload.reason,
+            mode: payload.mode,
+            minSamples: payload.minSamples,
+            webhook: payload.webhook,
           },
           { operator, via: 'dashboard', requestId, source },
         );
@@ -374,6 +390,13 @@ export async function handle(req, res) {
         ...(payload.isEmergencyLaunch === undefined
           ? {}
           : { emergency: Boolean(payload.isEmergencyLaunch) }),
+        // 坏包回退信号：客户端 watchdog 对比 pendingUpdateId 与实际 updateId 得出。
+        ...(payload.fallback === undefined
+          ? {}
+          : { fallback: Boolean(payload.fallback) }),
+        ...(payload.expectedUpdateId
+          ? { expectedUpdateId: String(payload.expectedUpdateId).slice(0, 64) }
+          : {}),
       });
       return send(res, {
         status: 202,
@@ -519,6 +542,14 @@ async function main() {
     );
     console.log(
       `[ota] 管理写操作: ${ADMIN_ENABLED ? '已启用（需 OTA_ADMIN_TOKEN / OTA_ADMIN_TOKENS）' : '未启用（设置 OTA_ADMIN_TOKEN 开启）'}`,
+    );
+    const sl = stopLossConfig();
+    console.log(
+      `[ota] 止损哨兵: ${
+        sl.enabled
+          ? `已启用（mode=${sl.mode}${sl.mode === 'monitor' ? '，仅告警不自动动作' : '，超阈值自动止血'}）`
+          : '未启用（设置 OTA_STOP_LOSS_ENABLED=true 开启，默认 monitor）'
+      }`,
     );
     console.log(
       '[ota] manifest: /api/manifest | assets: /api/assets | channels: /api/channels | metrics: /api/metrics | events: POST /api/events',

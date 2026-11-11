@@ -6,6 +6,7 @@ import {
   PRIVATE_KEY_PATH,
   PUBLIC_BASE_URL,
   SIGNING_ALG,
+  stopLossConfig,
 } from './config.mjs';
 import {
   contentTypeFor,
@@ -25,6 +26,7 @@ import {
   releaseDir,
 } from './release-store.mjs';
 import { parseUid, selectRelease } from './rollout.mjs';
+import { maybeStopLoss } from './stop-loss.mjs';
 
 const SUPPORTED_PLATFORMS = new Set(['ios', 'android']);
 
@@ -181,6 +183,14 @@ export async function buildManifestResponse({
       headers: { 'content-type': 'application/json' },
       body: Buffer.from(JSON.stringify({ error: 'unsupported platform' })),
     };
+  }
+
+  // 止损惰性评估：随真实更新请求顺带检查，进程内有 TTL 缓存。
+  // fire-and-forget，评估/止血都不得阻塞或影响更新链路。
+  if (stopLossConfig().enabled) {
+    void maybeStopLoss(runtimeVersion, channel).catch((error) => {
+      console.error('[ota] 止损评估失败（已忽略）:', error);
+    });
   }
 
   const channelRecord = await readChannel(runtimeVersion, channel);

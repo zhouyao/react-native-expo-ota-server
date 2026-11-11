@@ -1,6 +1,12 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { ADMIN_ENABLED, PUBLIC_BASE_URL, UPDATES_DIR } from './config.mjs';
+import {
+  ADMIN_ENABLED,
+  PUBLIC_BASE_URL,
+  UPDATES_DIR,
+  stopLossConfig,
+  webhookOrigin,
+} from './config.mjs';
 import {
   listChannels,
   listReleaseIds,
@@ -10,6 +16,7 @@ import {
 import { readJson } from './lib.mjs';
 import { aggregateMetrics, normalizePlatform, recentEvents } from './metrics.mjs';
 import { patchStats, releaseLaunchHashes } from './patch-store.mjs';
+import { evaluateChannels } from './stop-loss.mjs';
 
 const EVENTS_LIMIT_MAX = 200;
 
@@ -43,8 +50,32 @@ const EMPTY_METRICS = {
   byStatus: {},
   byDay: [],
   versions: {},
+  running: { byChannel: {} },
   patch: EMPTY_PATCH,
 };
+
+/**
+ * 把「设备实际运行版本」与通道指针对齐：
+ * current / previous / embedded（内置包）/ other（历史或其他版本）。
+ */
+function classifyRunning(entry, record) {
+  if (!entry) return { devices: 0, versions: [] };
+  const currentUpdateId = record?.updateId || null;
+  const previousUpdateId = record?.previous?.updateId || null;
+  return {
+    devices: entry.devices,
+    versions: entry.versions.map((version) => ({
+      ...version,
+      kind: version.embedded
+        ? 'embedded'
+        : currentUpdateId && version.updateId === currentUpdateId
+          ? 'current'
+          : previousUpdateId && version.updateId === previousUpdateId
+            ? 'previous'
+            : 'other',
+    })),
+  };
+}
 
 const EMPTY_CHANNEL_METRICS = {
   total: 0,
@@ -121,10 +152,14 @@ export async function buildDashboardState(requested, query = {}) {
     ? await aggregateMetrics(rv, { days: 7, platform })
     : EMPTY_METRICS;
   const byChannel = metrics.byChannel || {};
+  const runningByChannel = metrics.running?.byChannel || {};
 
   const channels = [];
   if (rv) {
-    for (const name of await listChannels(rv)) {
+    const channelNames = await listChannels(rv);
+    // 事件只读一次，按通道分组计算健康度，避免每个通道重复解析 events.jsonl。
+    const healthByChannel = await evaluateChannels(rv, channelNames);
+    for (const name of channelNames) {
       const record = await readChannel(rv, name);
       channels.push({
         channel: name,
@@ -136,6 +171,10 @@ export async function buildDashboardState(requested, query = {}) {
         rollout: record?.rollout || { percentage: 100, whitelist: [] },
         rolloutUpdatedAt: record?.rollout?.updatedAt || null,
         previous: record?.previous || null,
+        stopLoss: record?.stopLoss || null,
+        health: healthByChannel[name] || null,
+        // 设备上报的实际运行版本分布（非服务端下发指针）。
+        running: classifyRunning(runningByChannel[name], record),
         // 变更审计来自通道记录里已有的 history（最多保留 20 条，看板只取 5 条）
         history: Array.isArray(record?.history) ? record.history.slice(0, 5) : [],
         // 7 天通道维度指标，来自 aggregateMetrics 的 byChannel
@@ -205,10 +244,20 @@ export async function buildDashboardState(requested, query = {}) {
     ? await recentEvents(rv, eventsQuery)
     : { items: [], total: 0 };
 
+  const slc = stopLossConfig();
   return {
     generatedAt: new Date().toISOString(),
     publicBaseUrl: PUBLIC_BASE_URL,
     adminEnabled: ADMIN_ENABLED,
+    // 全局止损设置（脱敏：不返回 Webhook 明文，只给是否已配置与 origin）。
+    stopLoss: {
+      enabled: slc.enabled,
+      mode: slc.mode,
+      minSamples: slc.minSamples,
+      webhookConfigured: Boolean(slc.webhook),
+      webhookOrigin: webhookOrigin(slc.webhook),
+      overridden: slc.overridden || { minSamples: false, webhook: false },
+    },
     runtimeVersion: rv,
     platform,
     runtimeVersions: versions,
