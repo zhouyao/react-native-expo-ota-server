@@ -781,3 +781,176 @@ test('版本页：受保护版本不能回收，并提供回收预览入口', ()
   const roHtml = disabled.elements.get('#updates').innerHTML;
   assert.ok(!roHtml.includes('id="upGcPreview"'), '只读模式不显示回收预览');
 });
+
+test('设置页：回收设置回填生效值、来源与执行状态', () => {
+  const { elements } = runDashboard([], {
+    hash: '#settings',
+    state: {
+      gc: {
+        enabled: true,
+        mode: 'apply',
+        keepDays: 30,
+        keepLast: 5,
+        intervalMs: 3600000,
+        patchBases: 5,
+        overridden: { keepDays: true, keepLast: true, mode: true },
+        lastRunAt: '2026-01-01T00:00:00.000Z',
+        lastCandidates: 3,
+        lastRemoved: 2,
+        lastBytes: 2048,
+        lastError: null,
+      },
+    },
+  });
+
+  assert.equal(elements.get('#gcKeepDays').value, '30', '回填保留天数');
+  assert.equal(elements.get('#gcKeepLast').value, '5', '回填最少保留版本数');
+  assert.equal(elements.get('#gcMode').value, 'apply', '回填执行模式');
+  assert.equal(elements.get('#gcMode').disabled, false, '已开启自动回收时允许切换模式');
+  assert.ok(elements.get('#gcHint').textContent.includes('执行'), '展示当前生效模式');
+  const source = elements.get('#gcSource').textContent;
+  assert.ok(source.includes('自动回收已开启'));
+  assert.ok(source.includes('部分项由控制台覆盖'));
+  assert.ok(source.includes('候选 3'), '展示上次执行的候选数');
+});
+
+test('设置页：未开启 OTA_GC_ENABLED 时禁用执行模式切换', () => {
+  const { elements } = runDashboard([], {
+    hash: '#settings',
+    state: { gc: { enabled: false, mode: 'dry-run', keepDays: 14, keepLast: 10 } },
+  });
+
+  assert.equal(elements.get('#gcMode').disabled, true);
+  assert.ok(elements.get('#gcSource').textContent.includes('未开启'));
+});
+
+test('设置页：最少保留版本数低于差分 base 保护数时提示实际下限', () => {
+  const { elements } = runDashboard([], {
+    hash: '#settings',
+    state: {
+      gc: {
+        enabled: true,
+        mode: 'apply',
+        keepDays: 0,
+        keepLast: 3,
+        intervalMs: 3600000,
+        patchBases: 5,
+        overridden: { keepDays: false, keepLast: false, mode: false },
+      },
+    },
+  });
+
+  const hint = elements.get('#gcHint').textContent;
+  assert.ok(hint.includes('实际至少保留 5'), '应提示差分 base 带来的保留下限');
+  assert.ok(hint.includes('差分 base 保护要求 5 个'));
+});
+
+test('概览展示磁盘占用、补丁库与数据目录构成', () => {
+  const { elements } = runDashboard([], {
+    hash: '#overview',
+    state: {
+      stats: {
+        releases: 3,
+        channels: 2,
+        assetsBytes: 3000,
+        gzipBytes: 1200,
+        diskBytes: 4200,
+        patchCount: 4,
+        patchBytes: 500,
+        dirs: { releases: 4200, patches: 500, embedded: 100, metrics: 50, audit: 20 },
+      },
+    },
+  });
+
+  const cards = elements.get('#stats').innerHTML;
+  assert.ok(cards.includes('磁盘占用'), '应有磁盘占用卡片');
+  assert.ok(cards.includes('补丁库'), '应有补丁库卡片');
+  assert.ok(cards.includes('4.1 KB'), '磁盘占用使用去重后的 diskBytes');
+
+  const storage = elements.get('#storage').innerHTML;
+  for (const name of ['releases', 'patches', 'embedded', 'metrics', 'audit', '合计']) {
+    assert.ok(storage.includes(name), `数据目录应包含 ${name}`);
+  }
+  assert.ok(storage.includes('下发内容'), '合计行应拆出下发内容与 gzip 副本');
+});
+
+test('版本页：体积拆分为原始与 gzip，并可展开文件明细', () => {
+  const now = new Date().toISOString();
+  const releases = [
+    {
+      releaseId: '1111',
+      updateId: 'u-1111',
+      createdAt: now,
+      platforms: ['ios'],
+      currentChannels: [],
+      previousChannels: [],
+      size: 3000,
+      gzipBytes: 1200,
+      files: 4,
+      byKind: {
+        bundles: { files: 2, rawBytes: 3000, gzipBytes: 1200 },
+        assets: { files: 2, rawBytes: 0, gzipBytes: 0 },
+      },
+      largest: [{ file: 'bundles/abcdef012345.hbc', bytes: 3000, gzipBytes: 1200 }],
+      patchCount: 0,
+      patchBytes: 0,
+    },
+  ];
+  const { elements } = runDashboard([], {
+    hash: '#updates',
+    state: { adminEnabled: true, releases },
+  });
+  const html = elements.get('#updates').innerHTML;
+
+  assert.ok(html.includes('4 个文件'), '应显示文件数并可展开');
+  assert.ok(html.includes('+gz'), '应区分 gzip 副本体积');
+  assert.ok(html.includes('abcdef012345.hbc'), '展开区应列出最大文件');
+  assert.ok(html.includes('原始'), '展开区应有原始/gzip 分列');
+  assert.ok(html.includes('id="upOrphans"'), '应提供孤儿体检入口');
+});
+
+test('指标页展示下载流量与 Top 文件', () => {
+  const state = {
+    metrics: {
+      windowDays: 7,
+      total: 20,
+      manifests: 8,
+      assets: 10,
+      clientEvents: 2,
+      errors: 0,
+      uniqueUids: 3,
+      byStatus: { 200: 18, 206: 2 },
+      byPlatform: {},
+      byChannel: {},
+      byServed: {},
+      byDay: [],
+      versions: {},
+      patch: { requests: 2, hits: 1, fallbacks: 1, hitRate: 50, patchBytes: 200, fullBytes: 2000, savedBytes: 1800, savingRate: 90, reasons: {}, byPlatform: {}, byChannel: {}, byDay: [] },
+      transfer: {
+        requests: 10,
+        bytes: 5000,
+        rangeRequests: 2,
+        uniqueFiles: 2,
+        byKind: {
+          raw: { requests: 1, bytes: 1000 },
+          gzip: { requests: 5, bytes: 3000 },
+          range: { requests: 2, bytes: 800 },
+          patch: { requests: 2, bytes: 200 },
+        },
+        byFile: [
+          { file: 'bundles/large-asset.hbc', requests: 6, bytes: 4000 },
+          { file: 'assets/img.png', requests: 4, bytes: 1000 },
+        ],
+      },
+    },
+  };
+  const { elements } = runDashboard([], { hash: '#metrics', state });
+  const html = elements.get('#metrics').innerHTML;
+
+  assert.ok(html.includes('下载流量'), '应有下载流量小节');
+  assert.ok(html.includes('gzip 压缩'), '应区分 gzip 流量');
+  assert.ok(html.includes('差分补丁（226）'), '应区分补丁流量');
+  assert.ok(html.includes('Top 10 文件'), '应列出最占流量的文件');
+  assert.ok(html.includes('large-asset.hbc'));
+  assert.ok(html.includes('平均'), '应展示平均每次请求字节');
+});

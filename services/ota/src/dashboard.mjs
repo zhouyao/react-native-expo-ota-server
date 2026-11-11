@@ -3,6 +3,7 @@ import path from 'node:path';
 import {
   ADMIN_ENABLED,
   PUBLIC_BASE_URL,
+  gcConfig,
   stopLossConfig,
   webhookOrigin,
 } from './config.mjs';
@@ -11,11 +12,12 @@ import {
   listReleaseIds,
   readChannel,
   releaseDir,
+  runtimeDir,
   runtimeVersions,
 } from './release-store.mjs';
 import { readJson } from './lib.mjs';
 import { aggregateMetrics, normalizePlatform, recentEvents } from './metrics.mjs';
-import { patchStats, releaseLaunchHashes } from './patch-store.mjs';
+import { maxBases, patchStats, releaseLaunchHashes } from './patch-store.mjs';
 import { evaluateChannels } from './stop-loss.mjs';
 
 const EVENTS_LIMIT_MAX = 200;
@@ -35,6 +37,15 @@ const EMPTY_PATCH = {
   byDay: [],
 };
 
+const EMPTY_TRANSFER = {
+  requests: 0,
+  bytes: 0,
+  rangeRequests: 0,
+  uniqueFiles: 0,
+  byKind: {},
+  byFile: [],
+};
+
 const EMPTY_METRICS = {
   windowDays: 7,
   platform: '',
@@ -52,6 +63,7 @@ const EMPTY_METRICS = {
   versions: {},
   running: { byChannel: {} },
   patch: EMPTY_PATCH,
+  transfer: EMPTY_TRANSFER,
 };
 
 /**
@@ -115,36 +127,98 @@ function pickEventQuery(query = {}) {
  * `disk` 只统计首次见到的 inode：提升 / 重发用硬链接复用资产，
  * 不去重会把同一份字节算很多遍，让「磁盘占用」严重虚高。
  */
+/**
+ * 统计一个 release 的体积。
+ *
+ * - `rawBytes` 是客户端真正要下载的资产字节（不含 `.gz` 副本）；
+ * - `gzipBytes` 是发布时预压缩的 `.gz` 副本体积，只影响磁盘、不影响下发量；
+ * - `disk` 按 inode 去重：提升 / 重发用硬链接复用资产，不去重会把同一份字节算很多遍；
+ * - `largest` 取最大的几个原始资产，并带上对应 `.gz` 大小，便于定位「哪个文件最占地方」。
+ */
 async function statsOf(dir, seenInodes = new Set()) {
-  let size = 0;
+  const byKind = {};
+  let rawBytes = 0;
+  let gzipBytes = 0;
   let disk = 0;
   let files = 0;
+  const sizes = new Map();
+
   for (const sub of ['bundles', 'assets']) {
+    const kind = (byKind[sub] = { files: 0, rawBytes: 0, gzipBytes: 0 });
+    let entries;
     try {
-      const entries = await fsp.readdir(path.join(dir, sub), { withFileTypes: true });
-      for (const entry of entries) {
-        if (!entry.isFile()) continue;
-        const stat = await fsp.stat(path.join(dir, sub, entry.name));
-        size += stat.size;
-        files += 1;
-        const inode = `${stat.dev}:${stat.ino}`;
-        if (!seenInodes.has(inode)) {
-          seenInodes.add(inode);
-          disk += stat.size;
-        }
-      }
+      entries = await fsp.readdir(path.join(dir, sub), { withFileTypes: true });
     } catch {
-      // 没有 assets 目录属于正常情况
+      continue; // 没有 assets 目录属于正常情况
+    }
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const stat = await fsp.stat(path.join(dir, sub, entry.name));
+      files += 1;
+      kind.files += 1;
+      sizes.set(`${sub}/${entry.name}`, stat.size);
+      if (entry.name.endsWith('.gz')) {
+        gzipBytes += stat.size;
+        kind.gzipBytes += stat.size;
+      } else {
+        rawBytes += stat.size;
+        kind.rawBytes += stat.size;
+      }
+      const inode = `${stat.dev}:${stat.ino}`;
+      if (!seenInodes.has(inode)) {
+        seenInodes.add(inode);
+        disk += stat.size;
+      }
     }
   }
-  return { size, disk, files };
+
+  const largest = [...sizes.entries()]
+    .filter(([name]) => !name.endsWith('.gz'))
+    .map(([file, bytes]) => ({ file, bytes, gzipBytes: sizes.get(`${file}.gz`) || 0 }))
+    .sort((a, b) => b.bytes - a.bytes)
+    .slice(0, 5);
+
+  // size 保留为「全部文件字节」，仅用于兼容旧口径；下发表用 rawBytes。
+  return { size: rawBytes + gzipBytes, rawBytes, gzipBytes, disk, files, byKind, largest };
+}
+
+/** 目录内所有文件的字节数（补丁库 / 内置包 / 日志，不需要 inode 去重）。 */
+async function dirBytes(target) {
+  let total = 0;
+  let stat;
+  try {
+    stat = await fsp.stat(target);
+  } catch {
+    return 0;
+  }
+  // 审计日志是单个文件，直接取 size。
+  if (stat.isFile()) return stat.size;
+  let entries;
+  try {
+    entries = await fsp.readdir(target, { withFileTypes: true });
+  } catch {
+    return total;
+  }
+  for (const entry of entries) {
+    const full = path.join(target, entry.name);
+    if (entry.isDirectory()) {
+      total += await dirBytes(full);
+      continue;
+    }
+    try {
+      total += (await fsp.stat(full)).size;
+    } catch {
+      // 并发轮转 / 删除时文件可能已消失
+    }
+  }
+  return total;
 }
 
 /**
  * 只读聚合：通道状态、更新列表、指标与事件。
  * 指标与事件是两套查询：指标固定 7 天窗口，事件支持分页与过滤。
  */
-export async function buildDashboardState(requested, query = {}) {
+export async function buildDashboardState(requested, query = {}, runtime = {}) {
   const versions = await runtimeVersions();
   const rv = requested || versions[0] || '';
   // 顶部工具条的平台选择是全局筛选：指标、通道卡、事件流用同一口径。
@@ -210,6 +284,7 @@ export async function buildDashboardState(requested, query = {}) {
 
   const releases = [];
   let total = 0;
+  let gzipTotal = 0;
   let diskTotal = 0;
   // 跨 release 共享同一个 Set：硬链接复用的资产只算一次真实磁盘占用。
   const seenInodes = new Set();
@@ -217,7 +292,8 @@ export async function buildDashboardState(requested, query = {}) {
     const dir = releaseDir(rv, id);
     const meta = await readJson(path.join(dir, 'metadata.json'));
     const stats = await statsOf(dir, seenInodes);
-    total += stats.size;
+    total += stats.rawBytes;
+    gzipTotal += stats.gzipBytes;
     diskTotal += stats.disk;
     let patchCount = 0;
     let patchBytes = 0;
@@ -234,7 +310,11 @@ export async function buildDashboardState(requested, query = {}) {
       createdAt: meta?.createdAt || null,
       platforms: meta?.platforms || [],
       files: stats.files,
-      size: stats.size,
+      // 下发给客户端的字节（不含 .gz 副本）
+      size: stats.rawBytes,
+      gzipBytes: stats.gzipBytes,
+      byKind: stats.byKind,
+      largest: stats.largest,
       restoredFrom: meta?.restoredFrom || null,
       patchCount,
       patchBytes,
@@ -245,12 +325,24 @@ export async function buildDashboardState(requested, query = {}) {
     });
   }
 
+  // 数据目录构成：回答「磁盘到底被什么占了」。
+  const rvDir = rv ? runtimeDir(rv) : '';
+  const dirs = {
+    releases: diskTotal,
+    patches: rv ? await dirBytes(path.join(rvDir, 'patches')) : 0,
+    embedded: rv ? await dirBytes(path.join(rvDir, 'embedded')) : 0,
+    metrics: rv ? await dirBytes(path.join(rvDir, 'metrics')) : 0,
+    audit: rv ? await dirBytes(path.join(rvDir, 'audit.jsonl')) : 0,
+  };
+
   const eventsQuery = pickEventQuery(query);
   const eventsResult = rv
     ? await recentEvents(rv, eventsQuery)
     : { items: [], total: 0 };
 
   const slc = stopLossConfig();
+  const gcc = gcConfig();
+  const gcRuntime = runtime.gc || {};
   return {
     generatedAt: new Date().toISOString(),
     publicBaseUrl: PUBLIC_BASE_URL,
@@ -264,6 +356,21 @@ export async function buildDashboardState(requested, query = {}) {
       webhookOrigin: webhookOrigin(slc.webhook),
       overridden: slc.overridden || { minSamples: false, webhook: false },
     },
+    // 回收设置：只有 keepDays / keepLast / mode 可在控制台改，其余是只读展示。
+    gc: {
+      enabled: gcc.enabled,
+      mode: gcc.mode,
+      keepDays: gcc.keepDays,
+      keepLast: gcc.keepLast,
+      intervalMs: gcc.intervalMs,
+      patchBases: maxBases(),
+      overridden: gcc.overridden || { keepDays: false, keepLast: false, mode: false },
+      lastRunAt: gcRuntime.lastRunAt || null,
+      lastCandidates: gcRuntime.lastCandidates || 0,
+      lastRemoved: gcRuntime.lastRemoved || 0,
+      lastBytes: gcRuntime.lastBytes || 0,
+      lastError: gcRuntime.lastError || null,
+    },
     runtimeVersion: rv,
     platform,
     runtimeVersions: versions,
@@ -276,12 +383,16 @@ export async function buildDashboardState(requested, query = {}) {
     stats: {
       releases: releases.length,
       channels: channels.length,
-      // 逻辑体积：所有版本下发的字节之和（硬链接复用的会重复计入）。
+      // 下发给客户端的原始资产字节（不含 .gz），也是「这个版本多大」的口径。
       assetsBytes: total,
+      // 发布时预压缩的 .gz 副本，只占磁盘。
+      gzipBytes: gzipTotal,
       // 真实磁盘占用：按 inode 去重，提升 / 重发复用的资产只算一次。
       diskBytes: diskTotal,
       patchCount: patches.totalCount,
       patchBytes: patches.totalBytes,
+      // 数据目录构成：releases 是去重后的真实占用，其余是各子目录实际字节。
+      dirs,
     },
   };
 }

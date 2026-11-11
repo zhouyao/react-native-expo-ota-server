@@ -237,20 +237,128 @@ export function stopLossConfig() {
 }
 
 /**
+ * GC 运行时覆盖（控制台「设置 → 回收设置」）：$OTA_DATA_DIR/system/gc.json。
+ * 只允许覆盖「保留天数」「最少保留版本数」和「执行模式」，
+ * 开关 / 间隔 / 启动延迟仍由环境变量决定（部署层安全边界）。
+ */
+const GC_OVERRIDE_FILE = path.join(UPDATES_DIR, 'system', 'gc.json');
+let gcOverrideCache = { mtimeMs: -1, value: null };
+
+/** 至少保留 3 个版本：留出回滚 + 观察余量，避免误设成 1 直接清空历史。 */
+export const GC_KEEP_LAST_MIN = 3;
+export const GC_KEEP_LAST_MAX = 1000;
+export const GC_KEEP_DAYS_MAX = 3650;
+
+export function gcOverrideFile() {
+  return GC_OVERRIDE_FILE;
+}
+
+export function clearGcOverrideCache() {
+  gcOverrideCache = { mtimeMs: -1, value: null };
+}
+
+/** 同步读取覆盖（按 mtime 缓存，定时任务每次执行都会读）。 */
+export function readGcOverride() {
+  try {
+    const stat = fs.statSync(GC_OVERRIDE_FILE);
+    if (gcOverrideCache.mtimeMs === stat.mtimeMs) return gcOverrideCache.value;
+    const parsed = JSON.parse(fs.readFileSync(GC_OVERRIDE_FILE, 'utf8'));
+    const value = {
+      keepDays: Number.isInteger(Number(parsed.keepDays)) ? Number(parsed.keepDays) : undefined,
+      keepLast: Number.isInteger(Number(parsed.keepLast)) ? Number(parsed.keepLast) : undefined,
+      mode: parsed.mode === 'apply' || parsed.mode === 'dry-run' ? parsed.mode : undefined,
+      updatedAt: parsed.updatedAt || null,
+      operator: parsed.operator || null,
+    };
+    gcOverrideCache = { mtimeMs: stat.mtimeMs, value };
+    return value;
+  } catch {
+    gcOverrideCache = { mtimeMs: -1, value: null };
+    return null;
+  }
+}
+
+function normalizeKeepDays(raw) {
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0 || value > GC_KEEP_DAYS_MAX) {
+    throw new Error(`保留天数必须是 0-${GC_KEEP_DAYS_MAX} 的整数`);
+  }
+  return value;
+}
+
+function normalizeKeepLast(raw) {
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < GC_KEEP_LAST_MIN || value > GC_KEEP_LAST_MAX) {
+    throw new Error(
+      `最少保留版本数必须是 ${GC_KEEP_LAST_MIN}-${GC_KEEP_LAST_MAX} 的整数`,
+    );
+  }
+  return value;
+}
+
+/** undefined = 保持不变；其余必须是 dry-run / apply。 */
+function normalizeGcMode(raw) {
+  const value = String(raw ?? '').trim().toLowerCase();
+  if (value !== 'dry-run' && value !== 'apply') {
+    throw new Error('执行模式只能是 dry-run 或 apply');
+  }
+  return value;
+}
+
+/**
+ * 写入运行时覆盖。mode=apply 要求服务端已开启 OTA_GC_ENABLED，
+ * 否则先存一个「真删除」的模式，等别人打开开关就会立刻生效，风险太大。
+ */
+export async function writeGcOverride(patch, { operator = 'unknown' } = {}) {
+  const current = readGcOverride() || {};
+  const enabled = String(process.env.OTA_GC_ENABLED || '').toLowerCase() === 'true';
+  const nextMode = patch.mode === undefined ? undefined : normalizeGcMode(patch.mode);
+  if (nextMode === 'apply' && !enabled) {
+    throw new Error('服务端未开启 OTA_GC_ENABLED，不能切换为执行模式（自动回收未启用）');
+  }
+  const next = {
+    ...current,
+    ...(patch.keepDays === undefined ? {} : { keepDays: normalizeKeepDays(patch.keepDays) }),
+    ...(patch.keepLast === undefined ? {} : { keepLast: normalizeKeepLast(patch.keepLast) }),
+    ...(nextMode === undefined ? {} : { mode: nextMode }),
+    updatedAt: new Date().toISOString(),
+    operator,
+  };
+  if (next.keepDays === undefined) delete next.keepDays;
+  if (next.keepLast === undefined) delete next.keepLast;
+  if (next.mode === undefined) delete next.mode;
+  await writeJsonAtomic(GC_OVERRIDE_FILE, next);
+  clearGcOverrideCache();
+  return next;
+}
+
+/**
  * 存储回收（GC）配置：默认关闭，且默认只做 dry-run。
  * 与止损哨兵一样按需读取，避免模块加载时固化，便于测试覆盖。
  * 回收不可恢复，因此线上开启时建议先观察一段 dry-run 日志再切 apply。
+ *
+ * 优先级：控制台覆盖 > 环境变量 > 默认值。
+ * 未开启 OTA_GC_ENABLED 时强制 dry-run：关闭状态下不存在「真实删除」这一语义。
  */
 export function gcConfig() {
-  const mode = String(process.env.OTA_GC_MODE || 'dry-run').toLowerCase();
+  const override = readGcOverride() || {};
+  const enabled = String(process.env.OTA_GC_ENABLED || '').toLowerCase() === 'true';
+  const envMode = String(process.env.OTA_GC_MODE || 'dry-run').toLowerCase() === 'apply'
+    ? 'apply'
+    : 'dry-run';
   return {
-    enabled: String(process.env.OTA_GC_ENABLED || '').toLowerCase() === 'true',
-    mode: mode === 'apply' ? 'apply' : 'dry-run',
+    enabled,
+    mode: enabled ? override.mode || envMode : 'dry-run',
     intervalMs: envNumber('OTA_GC_INTERVAL_MS', 6 * 60 * 60 * 1000, { min: 60_000, strict: true }),
     initialDelayMs: envNumber('OTA_GC_INITIAL_DELAY_MS', 5 * 60 * 1000, { min: 0 }),
-    keepDays: envNumber('OTA_GC_KEEP_DAYS', 14, { min: 0 }),
+    keepDays: override.keepDays ?? envNumber('OTA_GC_KEEP_DAYS', 14, { min: 0 }),
     // min=0 + strict：允许 1，拒绝 0（否则可能连最新版本一起回收）。
-    keepLast: envNumber('OTA_GC_KEEP_LAST', 10, { min: 0, strict: true }),
+    keepLast: override.keepLast ?? envNumber('OTA_GC_KEEP_LAST', 10, { min: 0, strict: true }),
+    overridden: {
+      keepDays: override.keepDays !== undefined,
+      keepLast: override.keepLast !== undefined,
+      mode: override.mode !== undefined && enabled,
+    },
   };
 }
 

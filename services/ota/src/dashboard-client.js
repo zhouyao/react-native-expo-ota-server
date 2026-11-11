@@ -21,9 +21,6 @@
     if (isNaN(d.getTime())) return '-';
     return d.toLocaleString();
   }
-  function fmtShort(v) {
-    return v ? String(v).slice(0, 8) : '-';
-  }
   function fmtBytes(n) {
     if (!n) return '0 B';
     if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
@@ -212,6 +209,83 @@
     }
   }
 
+  /** 设置页的回收输入是否被用户改过。 */
+  function gcSettingsDirty() {
+    var days = $('#gcKeepDays');
+    if (days && days.dataset.orig !== undefined && days.value !== days.dataset.orig) return true;
+    var last = $('#gcKeepLast');
+    if (last && last.dataset.orig !== undefined && last.value !== last.dataset.orig) return true;
+    var mode = $('#gcMode');
+    if (mode && mode.dataset.orig !== undefined && mode.value !== mode.dataset.orig) return true;
+    return false;
+  }
+
+  /** 回填回收设置（force=true 时无条件覆盖，用于保存成功后）。 */
+  function syncGcSettings(force) {
+    var gc = state.gc || {};
+    if (force || !gcSettingsDirty()) {
+      var days = $('#gcKeepDays');
+      if (days) {
+        days.value = gc.keepDays === undefined || gc.keepDays === null ? '' : String(gc.keepDays);
+        days.dataset.orig = days.value;
+      }
+      var last = $('#gcKeepLast');
+      if (last) {
+        last.value = gc.keepLast === undefined || gc.keepLast === null ? '' : String(gc.keepLast);
+        last.dataset.orig = last.value;
+      }
+      var mode = $('#gcMode');
+      if (mode) {
+        mode.value = gc.mode === 'apply' ? 'apply' : 'dry-run';
+        mode.dataset.orig = mode.value;
+      }
+    }
+
+    // 未开启 OTA_GC_ENABLED 时不允许在控制台切「执行」：自动回收的闸门在部署层。
+    var modeEl = $('#gcMode');
+    if (modeEl) modeEl.disabled = !gc.enabled;
+
+    var ov = gc.overridden || {};
+    // 差分 base 也受保护：实际保留数 = max(最少保留版本数, 差分 base 保护数)，
+    // 否则「设了 3 却只删到剩 5 个」会让人以为回收没生效。
+    var keepLast = gc.keepLast === undefined || gc.keepLast === null ? 0 : Number(gc.keepLast);
+    var patchBases = gc.patchBases === undefined || gc.patchBases === null ? 0 : Number(gc.patchBases);
+    var effectiveKeep = Math.max(keepLast, patchBases);
+    var hint = $('#gcHint');
+    if (hint) {
+      hint.textContent = '当前生效：保留 ' + (gc.keepDays === undefined ? '-' : String(gc.keepDays)) + ' 天'
+        + ' / 最少 ' + (gc.keepLast === undefined ? '-' : String(gc.keepLast)) + ' 个'
+        + ' · 模式 ' + (gc.mode === 'apply' ? '执行（真实删除）' : '预览（只记录）');
+    }
+    if (hint && patchBases > keepLast) {
+      hint.textContent += '（实际至少保留 ' + effectiveKeep + ' 个：差分 base 保护要求 ' + patchBases
+        + ' 个，高于所设的最少保留版本数）';
+    }
+
+    var source = $('#gcSource');
+    if (source) {
+      var parts = [];
+      parts.push(gc.enabled ? '自动回收已开启' : '自动回收未开启（需服务端 OTA_GC_ENABLED=true）');
+      parts.push('间隔 ' + Math.round(Number(gc.intervalMs || 0) / 60000) + ' 分钟');
+      parts.push('差分 base 保护 ' + (gc.patchBases === undefined ? 0 : gc.patchBases) + ' 个');
+      parts.push(
+        ov.keepDays || ov.keepLast || ov.mode
+          ? '部分项由控制台覆盖'
+          : '全部来自环境变量',
+      );
+      if (gc.lastRunAt) {
+        parts.push(
+          '上次执行 ' + fmtTime(gc.lastRunAt) + '（候选 ' + (gc.lastCandidates || 0)
+            + '、回收 ' + (gc.lastRemoved || 0) + ' 个 / ' + fmtBytes(gc.lastBytes || 0) + '）',
+        );
+      } else {
+        parts.push('尚未执行过');
+      }
+      if (gc.lastError) parts.push('最近错误：' + gc.lastError);
+      source.textContent = parts.join(' · ');
+    }
+  }
+
   /** 设置页：左侧分类切换右侧内容。 */
   function renderSettings() {
     var tab = view.settings.tab || 'token';
@@ -226,23 +300,59 @@
       panels[j].hidden = panels[j].dataset.settingsPanel !== tab;
     }
     syncStopLossSettings(false);
+    syncGcSettings(false);
   }
 
   // ---------- 渲染：概览 ----------
   function renderStats() {
     var m = state.metrics || {};
     var p = m.patch || {};
+    var s = state.stats || {};
+    var errRate = pct(m.errors, m.total);
+    // 按「运营核心 → 资产 → 效率」分组；宽屏 4 列，前 4 项一行、后 4 项一行。
     var cards = [
-      ['通道', esc(state.stats.channels), '当前 runtimeVersion 下的通道数'],
-      ['历史发布', esc(state.stats.releases), '每次发布/提升/回滚/重发都新增一条不可变产物；实际磁盘占用 ' + fmtBytes(state.stats.diskBytes) + '（提升/重发复用的资产按 inode 去重）'],
-      ['7 天 manifest 请求', esc(m.manifests), '指标窗口固定 7 天' + (view.platform ? '，已按平台 ' + view.platform + ' 筛选' : '')],
-      ['差分命中率', esc(p.hitRate || 0) + '%', '口径：7 天内带 A-IM 的 asset 请求中返回 226 补丁的占比，' + esc(p.hits || 0) + '/' + esc(p.requests || 0)],
-      ['节省流量', fmtBytes(p.savedBytes), '补丁相比 gzip 完整包累计节省的下载字节'],
-      ['错误率', pct(m.errors, m.total) + '%', '口径：7 天内全部事件（manifest / asset / 客户端上报）中 status>=400 的占比，' + esc(m.errors) + '/' + esc(m.total)],
+      { label: '通道', value: esc(s.channels), hint: '当前 runtimeVersion 下的通道数' },
+      { label: '历史发布', value: esc(s.releases), hint: '每次发布/提升/回滚/重发都新增一条不可变产物；下发内容合计 ' + fmtBytes(s.assetsBytes || 0) + '（不含 gzip 副本）' },
+      { label: '7 天 manifest 请求', value: esc(m.manifests), hint: '指标窗口固定 7 天' + (view.platform ? '，已按平台 ' + view.platform + ' 筛选' : '') },
+      { label: '错误率', value: errRate + '%', hint: '口径：7 天内全部事件（manifest / asset / 客户端上报）中 status>=400 的占比，' + esc(m.errors) + '/' + esc(m.total), tone: errRate > 0 ? 'bad' : '' },
+      { label: '磁盘占用', value: fmtBytes(s.diskBytes || 0), hint: '按 inode 去重后的真实占用：提升/重发用硬链接复用的资产只算一次，含 gzip 副本与日志' },
+      { label: '补丁库', value: esc(s.patchCount || 0) + ' 个 / ' + fmtBytes(s.patchBytes || 0), hint: '差分补丁文件数量与体积；命中率见指标页' },
+      { label: '差分命中率', value: esc(p.hitRate || 0) + '%', hint: '口径：7 天内带 A-IM 的 asset 请求中返回 226 补丁的占比，' + esc(p.hits || 0) + '/' + esc(p.requests || 0), tone: 'blue' },
+      { label: '节省流量', value: fmtBytes(p.savedBytes), hint: '补丁相比 gzip 完整包累计节省的下载字节', tone: 'ok' },
     ];
     $('#stats').innerHTML = cards.map(function (c) {
-      return '<div class="stat" title="' + esc(c[2]) + '"><b>' + c[1] + '</b><span>' + esc(c[0]) + '</span></div>';
+      return '<div class="stat" title="' + esc(c.hint) + '"><b'
+        + (c.tone ? ' class="tone-' + c.tone + '"' : '')
+        + '>' + c.value + '</b><span>' + esc(c.label) + '</span></div>';
     }).join('');
+  }
+
+  /** 数据目录构成：磁盘到底被什么占了。 */
+  function renderStorage() {
+    var s = state.stats || {};
+    var dirs = s.dirs || {};
+    var rows = [
+      ['releases', dirs.releases || 0, '发布产物（按 inode 去重）'],
+      ['patches', dirs.patches || 0, '差分补丁库'],
+      ['embedded', dirs.embedded || 0, '已注册内置包'],
+      ['metrics', dirs.metrics || 0, 'events.jsonl 及轮转文件'],
+      ['audit', dirs.audit || 0, 'audit.jsonl'],
+    ];
+    var total = rows.reduce(function (sum, row) { return sum + row[1]; }, 0);
+    var body = rows.map(function (row) {
+      var share = total ? Math.round((row[1] / total) * 100) : 0;
+      return '<tr><td><b>' + esc(row[0]) + '</b></td>'
+        + '<td>' + esc(fmtBytes(row[1])) + '</td>'
+        + '<td>' + esc(share) + '%</td>'
+        + '<td class="meta">' + esc(row[2]) + '</td></tr>';
+    }).join('');
+    $('#storage').innerHTML = ''
+      + '<div class="table-wrap"><table><thead><tr><th>目录</th><th>占用</th><th>占比</th><th>说明</th></tr></thead><tbody>'
+      + body
+      + '<tr><td><b>合计</b></td><td>' + esc(fmtBytes(total)) + '</td><td>100%</td>'
+      + '<td class="meta">下发内容 ' + esc(fmtBytes(s.assetsBytes || 0))
+      + ' + gzip 副本 ' + esc(fmtBytes(s.gzipBytes || 0)) + '</td></tr>'
+      + '</tbody></table></div>';
   }
 
   function dayBarsHtml(byDay) {
@@ -276,19 +386,19 @@
       var topRun = c.running && c.running.versions && c.running.versions[0];
       var runCell = topRun
         ? '<span class="mono" title="' + escAttr(topRun.updateId || 'embedded') + '">'
-          + esc(fmtShort(topRun.updateId || 'embedded')) + '</span> '
+          + esc(topRun.updateId || 'embedded') + '</span> '
           + '<span class="meta">' + esc(topRun.devices) + ' 台</span> '
           + runningKindTag(topRun.kind)
         : '<span class="empty">暂无上报</span>';
       return '<tr><td><b>' + esc(c.channel) + '</b> ' + badge + ' ' + healthBadge(c.health) + '</td>'
-        + '<td class="mono" title="' + escAttr(c.releaseId) + '">' + esc(fmtShort(c.releaseId)) + '</td>'
+        + '<td class="mono" title="' + escAttr(c.releaseId) + '">' + esc(c.releaseId) + '</td>'
         + '<td>' + runCell + '</td>'
         + '<td>' + clamp(c.rollout && c.rollout.percentage, 0, 100) + '%' + platformRolloutTag(c.rollout) + '</td>'
         + '<td>' + esc(cm.total || 0) + '</td>'
         + '<td>' + esc(cm.errors || 0) + '</td></tr>';
     }).join('');
-    $('#overviewChannels').innerHTML = '<table><thead><tr><th>通道</th><th>current</th><th>实际运行</th><th>灰度</th><th>7天</th><th>错误</th></tr></thead><tbody>'
-      + (rows || '<tr><td colspan="6" class="empty">暂无通道</td></tr>') + '</tbody></table>';
+    $('#overviewChannels').innerHTML = '<div class="table-wrap"><table><thead><tr><th>通道</th><th>current</th><th>实际运行</th><th>灰度</th><th>7天</th><th>错误</th></tr></thead><tbody>'
+      + (rows || '<tr><td colspan="6" class="empty">暂无通道</td></tr>') + '</tbody></table></div>';
   }
 
   function renderOverviewEvents() {
@@ -298,8 +408,8 @@
         + '</td><td>' + esc(e.channel) + '</td><td class="mono">' + esc(e.uid || '-')
         + '</td><td><span class="tag ' + cls + '">' + esc(e.status) + '</span></td></tr>';
     }).join('');
-    $('#overviewEvents').innerHTML = '<table><thead><tr><th>时间</th><th>类型</th><th>平台</th><th>通道</th><th>uid</th><th>状态</th></tr></thead><tbody>'
-      + (rows || '<tr><td colspan="6" class="empty">暂无事件</td></tr>') + '</tbody></table>';
+    $('#overviewEvents').innerHTML = '<div class="table-wrap"><table><thead><tr><th>时间</th><th>类型</th><th>平台</th><th>通道</th><th>uid</th><th>状态</th></tr></thead><tbody>'
+      + (rows || '<tr><td colspan="6" class="empty">暂无事件</td></tr>') + '</tbody></table></div>';
   }
 
   // ---------- 渲染：Channels ----------
@@ -323,7 +433,7 @@
     });
     var releaseOptions = (state.releases || []).slice(0, 50).map(function (r) {
       return '<option value="' + escAttr(r.releaseId) + '">' + esc(r.releaseId) + ' · '
-        + esc(fmtShort(r.updateId)) + ' · ' + esc(fmtTime(r.createdAt)) + '</option>';
+        + esc(r.updateId) + ' · ' + esc(fmtTime(r.createdAt)) + '</option>';
     }).join('');
 
     if (!list.length) {
@@ -408,7 +518,7 @@
         var kind = runningKindLabel[v.kind] || ['gray', v.kind || '未知'];
         return '<tr><td class="mono" title="' + escAttr(v.updateId || 'embedded') + '">'
           + esc(v.updateId || 'embedded') + '</td>'
-          + '<td class="mono">' + esc(fmtShort(v.releaseId)) + '</td>'
+          + '<td class="mono" title="' + escAttr(v.releaseId) + '">' + esc(v.releaseId) + '</td>'
           + '<td>' + esc(v.platform === 'unknown' ? '未标记' : v.platform) + '</td>'
           + '<td>' + esc(v.devices) + '</td>'
           + '<td>' + esc(fmtTime(v.lastAt)) + '</td>'
@@ -442,7 +552,7 @@
           + '<span class="meta"> · ' + esc(historyItems[0].action) + ' · ' + esc(fmtTime(historyItems[0].at)) + '</span></summary>'
           + '<ul class="history">' + historyItems.map(function (h) {
             return '<li><b>' + esc(h.action) + '</b><span class="meta">' + esc(fmtTime(h.at)) + '</span>'
-              + (h.releaseId ? ' <code title="' + escAttr(h.releaseId) + '">' + esc(fmtShort(h.releaseId)) + '</code>' : '')
+              + (h.releaseId ? ' <code title="' + escAttr(h.releaseId) + '">' + esc(h.releaseId) + '</code>' : '')
               + (h.operator ? '<span class="meta">' + esc(h.operator) + (h.via ? '（' + esc(h.via) + '）' : '') + '</span>' : '')
               + '</li>';
           }).join('') + '</ul></details>'
@@ -529,6 +639,45 @@
   }
 
   // ---------- 渲染：Metrics 明细 ----------
+  /** 指标页的下载流量小节：区分原始 / gzip / 分片 / 补丁，并给出最占流量的文件。 */
+  function transferSection(m) {
+    var t = m.transfer || {};
+    if (!t.requests) {
+      return '<div class="panel"><h2>下载流量 <span class="meta">最近 7 天</span></h2>'
+        + '<div class="empty">暂无资源请求（旧事件没有 bytes 字段，新请求会开始统计）</div></div>';
+    }
+    var kindLabel = { raw: '原始字节', gzip: 'gzip 压缩', range: '分片（206）', patch: '差分补丁（226）' };
+    var kindRows = ['raw', 'gzip', 'range', 'patch'].map(function (kind) {
+      var v = (t.byKind && t.byKind[kind]) || { requests: 0, bytes: 0 };
+      return '<tr><td><b>' + esc(kindLabel[kind]) + '</b></td><td>' + esc(v.requests || 0) + '</td>'
+        + '<td>' + esc(fmtBytes(v.bytes || 0)) + '</td>'
+        + '<td>' + esc(pct(v.bytes || 0, t.bytes || 0)) + '%</td></tr>';
+    }).join('');
+    var fileRows = (t.byFile || []).map(function (file) {
+      var name = String(file.file || '');
+      return '<tr><td class="mono" title="' + escAttr(name) + '">' + esc(name.split('/').pop()) + '</td>'
+        + '<td>' + esc(file.requests || 0) + '</td>'
+        + '<td>' + esc(fmtBytes(file.bytes || 0)) + '</td>'
+        + '<td>' + esc(fmtBytes(file.requests ? Math.round(file.bytes / file.requests) : 0)) + '</td></tr>';
+    }).join('');
+    return '<div class="panel"><h2>下载流量 <span class="meta">最近 7 天</span></h2>'
+      + '<div class="meta">资源请求 ' + esc(t.requests || 0)
+      + ' · 下发 ' + esc(fmtBytes(t.bytes || 0))
+      + ' · 平均 ' + esc(fmtBytes(t.requests ? Math.round(t.bytes / t.requests) : 0)) + '/请求'
+      + ' · 分片请求 ' + esc(t.rangeRequests || 0)
+      + ' · 涉及文件 ' + esc(t.uniqueFiles || 0) + '</div>'
+      + '<div class="grid-2">'
+      + '<div class="stat"><h2>按类型</h2><div class="table-wrap"><table><thead><tr><th>类型</th><th>请求</th><th>下发</th><th>占比</th></tr></thead><tbody>'
+      + kindRows + '</tbody></table></div></div>'
+      + (fileRows
+        ? '<div class="stat"><h2>Top 10 文件</h2>'
+          + '<div class="table-wrap"><table><thead><tr><th>文件</th><th>请求</th><th>下发</th><th>平均</th></tr></thead><tbody>'
+          + fileRows + '</tbody></table></div></div>'
+        : '')
+      + '</div>'
+      + '</div>';
+  }
+
   /** 指标页的增量差分小节：命中/回退、节省量、按平台与按通道。 */
   function patchSection(m) {
     var p = m.patch || {};
@@ -541,7 +690,10 @@
         + '<td>' + esc(fmtBytes(v.savedBytes)) + '</td></tr>';
     }).join('');
     var byChannel = p.byChannel || {};
-    var channelRows = Object.keys(byChannel).sort(function (a, b) {
+    // 兼容历史数据里被兜底成 '-' 的空通道 key，不在「按通道」表里展示。
+    var channelRows = Object.keys(byChannel).filter(function (name) {
+      return name && name !== '-';
+    }).sort(function (a, b) {
       return (byChannel[b].requests || 0) - (byChannel[a].requests || 0);
     }).map(function (name) {
       var v = byChannel[name];
@@ -556,19 +708,21 @@
       return '<span class="tag gray">' + esc(reason) + ' × ' + esc(reasons[reason]) + '</span>';
     }).join('') || '<span class="empty">暂无</span>';
 
-    return '<h2 style="margin-top:16px">增量差分（最近 7 天）</h2>'
+    return '<div class="panel"><h2>增量差分 <span class="meta">最近 7 天</span></h2>'
       + '<div class="meta">请求 ' + esc(p.requests || 0) + ' · 命中 ' + esc(p.hits || 0)
       + ' · 回退 ' + esc(p.fallbacks || 0) + ' · 命中率 ' + esc(p.hitRate || 0) + '%'
       + ' · 补丁 ' + esc(fmtBytes(p.patchBytes)) + ' / 全量 ' + esc(fmtBytes(p.fullBytes))
       + ' · 节省 ' + esc(fmtBytes(p.savedBytes)) + '（' + esc(p.savingRate || 0) + '%）</div>'
       + '<div class="meta" style="margin:8px 0">回退原因：' + reasonTags + '</div>'
-      + '<div class="table-wrap"><table><thead><tr><th>平台</th><th>请求</th><th>命中</th><th>回退</th><th>命中率</th><th>节省</th></tr></thead><tbody>'
-      + (platformRows || '<tr><td colspan="6" class="empty">暂无数据</td></tr>') + '</tbody></table></div>'
-      + '<h2 style="margin-top:16px">差分按通道（受顶部筛选影响）</h2>'
-      + '<div class="table-wrap"><table><thead><tr><th>通道</th><th>请求</th><th>命中</th><th>命中率</th><th>节省</th></tr></thead><tbody>'
-      + (channelRows || '<tr><td colspan="5" class="empty">暂无数据</td></tr>') + '</tbody></table></div>'
+      + '<div class="grid-2">'
+      + '<div class="stat"><h2>按平台</h2><div class="table-wrap"><table><thead><tr><th>平台</th><th>请求</th><th>命中</th><th>回退</th><th>命中率</th><th>节省</th></tr></thead><tbody>'
+      + (platformRows || '<tr><td colspan="6" class="empty">暂无数据</td></tr>') + '</tbody></table></div></div>'
+      + '<div class="stat"><h2>按通道 <span class="meta">受顶部筛选影响</span></h2><div class="table-wrap"><table><thead><tr><th>通道</th><th>请求</th><th>命中</th><th>命中率</th><th>节省</th></tr></thead><tbody>'
+      + (channelRows || '<tr><td colspan="5" class="empty">暂无数据</td></tr>') + '</tbody></table></div></div>'
+      + '</div>'
       + '<div class="meta" style="margin-top:8px">补丁库：' + esc((state.stats || {}).patchCount || 0)
-      + ' 个 / ' + esc(fmtBytes((state.stats || {}).patchBytes)) + '</div>';
+      + ' 个 / ' + esc(fmtBytes((state.stats || {}).patchBytes)) + '</div>'
+      + '</div>';
   }
 
   function renderMetricsDetail() {
@@ -595,7 +749,7 @@
     var versionRows = Object.keys(m.versions || {}).sort(function (a, b) {
       return m.versions[b] - m.versions[a];
     }).slice(0, 5).map(function (updateId) {
-      return '<tr><td class="mono">' + esc(fmtShort(updateId)) + '</td><td class="mono">' + esc(updateToRelease[updateId] || '-')
+      return '<tr><td class="mono" title="' + escAttr(updateId) + '">' + esc(updateId) + '</td><td class="mono">' + esc(updateToRelease[updateId] || '-')
         + '</td><td>' + esc(m.versions[updateId]) + '</td></tr>';
     }).join('');
 
@@ -615,21 +769,33 @@
         + ' 条未标记平台事件（资源请求失败 / 历史数据），不属于设备平台，未计入上表；可在「事件」页的平台筛选选择「未标记」查看。</div>'
       : '';
 
+    var kpis = [
+      { label: '事件总数', value: esc(m.total || 0), hint: '7 天窗口内全部事件（manifest / asset / 客户端上报）' },
+      { label: 'manifest 请求', value: esc(m.manifests || 0), hint: '客户端拉取 manifest 的次数' },
+      { label: '资源请求', value: esc(m.assets || 0), hint: 'bundles / assets 下载请求' },
+      { label: '客户端上报', value: esc(m.clientEvents || 0), hint: '客户端主动上报的事件' },
+      { label: '独立设备', value: esc(m.uniqueUids || 0), hint: '7 天内去重后的设备数' },
+    ];
+    var kpiHtml = kpis.map(function (c) {
+      return '<div class="stat" title="' + esc(c.hint) + '"><b>' + c.value + '</b><span>' + esc(c.label) + '</span></div>';
+    }).join('');
+
     $('#metrics').innerHTML = ''
-      + '<div class="meta">窗口 ' + esc(m.windowDays || 7) + ' 天 · 事件 ' + esc(m.total || 0) + ' · manifest ' + esc(m.manifests || 0)
-      + ' · 资源请求 ' + esc(m.assets || 0) + ' · 客户端上报 ' + esc(m.clientEvents || 0) + '</div>'
-      + '<div class="meta" style="margin:8px 0">状态码分布：' + statusRows + '</div>'
-      + '<h2 style="margin-top:16px">按平台（全量，不受顶部筛选影响）</h2>'
+      + '<div class="stats" style="margin-bottom:16px">' + kpiHtml + '</div>'
+      + '<div class="panel"><h2>状态码分布 <span class="meta">窗口 ' + esc(m.windowDays || 7) + ' 天</span></h2>' + statusRows + '</div>'
+      + '<div class="panel"><h2>按平台 <span class="meta">全量，不受顶部筛选影响</span></h2>'
       + '<div class="table-wrap"><table><thead><tr><th>平台</th><th>事件</th><th>manifest</th><th>资源</th><th>客户端</th><th>设备</th><th>current / previous / whitelist</th><th>错误</th><th>错误率</th></tr></thead><tbody>'
       + (platformRows || '<tr><td colspan="9" class="empty">暂无数据</td></tr>') + '</tbody></table></div>'
       + unattributedNote
-      + '<h2 style="margin-top:16px">按通道（受顶部筛选影响）</h2>'
+      + '</div>'
+      + '<div class="panel"><h2>按通道 <span class="meta">受顶部筛选影响</span></h2>'
       + '<div class="table-wrap"><table><thead><tr><th>通道</th><th>事件</th><th>manifest</th><th>current</th><th>previous</th><th>whitelist</th><th>设备</th><th>错误</th></tr></thead><tbody>'
-      + (channelRows || '<tr><td colspan="8" class="empty">暂无数据</td></tr>') + '</tbody></table></div>'
+      + (channelRows || '<tr><td colspan="8" class="empty">暂无数据</td></tr>') + '</tbody></table></div></div>'
       + (versionRows
-        ? '<h2 style="margin-top:16px">updateId 命中 Top 5</h2><div class="table-wrap"><table><thead><tr><th>updateId</th><th>releaseId</th><th>manifest 命中</th></tr></thead><tbody>' + versionRows + '</tbody></table></div>'
+        ? '<div class="panel"><h2>updateId 命中 Top 5</h2><div class="table-wrap"><table><thead><tr><th>updateId</th><th>releaseId</th><th>manifest 命中</th></tr></thead><tbody>' + versionRows + '</tbody></table></div></div>'
         : '')
-      + patchSection(m);
+      + patchSection(m)
+      + transferSection(m);
   }
 
   // ---------- 渲染：Updates ----------
@@ -683,6 +849,32 @@
     return Object.keys(runInfo.channels).some(function (name) {
       return (runInfo.channels[name].kinds[filter] || 0) > 0;
     });
+  }
+
+  /** 版本页展开区：按目录（bundles / assets）汇总 + 最大的几个文件。 */
+  function renderReleaseFiles(r) {
+    var kinds = r.byKind || {};
+    var kindRows = ['bundles', 'assets'].map(function (name) {
+      var value = kinds[name];
+      if (!value) return '';
+      return '<tr><td><b>' + esc(name) + '</b></td><td>' + esc(value.files || 0) + '</td>'
+        + '<td>' + esc(fmtBytes(value.rawBytes || 0)) + '</td>'
+        + '<td>' + esc(fmtBytes(value.gzipBytes || 0)) + '</td></tr>';
+    }).join('');
+    var topRows = (r.largest || []).map(function (file) {
+      var name = String(file.file || '');
+      return '<tr><td class="mono" title="' + escAttr(name) + '">' + esc(name.split('/').pop()) + '</td>'
+        + '<td>' + esc(fmtBytes(file.bytes || 0)) + '</td>'
+        + '<td>' + esc(fmtBytes(file.gzipBytes || 0)) + '</td></tr>';
+    }).join('');
+    return '<div class="rel-files">'
+      + '<table><thead><tr><th>目录</th><th>文件数</th><th>原始</th><th>gzip</th></tr></thead><tbody>'
+      + kindRows + '</tbody></table>'
+      + (topRows
+        ? '<table><thead><tr><th>最大文件</th><th>原始</th><th>gzip</th></tr></thead><tbody>'
+          + topRows + '</tbody></table>'
+        : '')
+      + '</div>';
   }
 
   function renderUpdates(options) {
@@ -743,9 +935,12 @@
         : (!state.adminEnabled ? '未配置管理令牌' : '回收该版本目录，不可恢复');
       return '<tr><td>' + esc(fmtTime(r.createdAt)) + '</td>'
         + '<td class="mono">' + esc(r.releaseId) + ' <button type="button" class="mini" data-copy="' + escAttr(r.releaseId) + '">复制</button></td>'
-        + '<td class="mono" title="' + escAttr(r.updateId) + '">' + esc(fmtShort(r.updateId)) + '</td>'
+        + '<td class="mono" title="' + escAttr(r.updateId) + '">' + esc(r.updateId) + '</td>'
         + '<td>' + esc((r.platforms || []).join(', ')) + '</td>'
-        + '<td>' + esc(fmtBytes(r.size)) + '</td>'
+        + '<td>' + esc(fmtBytes(r.size))
+        + (r.gzipBytes ? ' <span class="meta">+gz ' + esc(fmtBytes(r.gzipBytes)) + '</span>' : '')
+        + (r.files ? ' <details><summary>' + esc(r.files) + ' 个文件</summary>' + renderReleaseFiles(r) + '</details>' : '')
+        + '</td>'
         + '<td title="以此版本为目标的补丁数 / 体积">' + esc(r.patchCount || 0)
         + ' / ' + esc(fmtBytes(r.patchBytes)) + '</td>'
         + '<td>' + renderRunningCell(runInfo) + '</td>'
@@ -789,6 +984,7 @@
       + '<input id="upQuery" type="search" placeholder="搜索 releaseId / updateId / 通道（空格分隔多关键词）" value="' + escAttr(query) + '">'
       + '<button type="button" id="upClear"' + (filtering ? '' : ' disabled') + '>重置</button>'
       + (state.adminEnabled ? '<button type="button" id="upGcPreview" title="按保留策略预览将被回收的版本（不删除）">回收预览</button>' : '')
+      + (state.adminEnabled ? '<button type="button" id="upOrphans" title="扫描没有任何版本 / 补丁 / 内置包引用的文件（只读）">孤儿体检</button>' : '')
       + '<span class="meta">' + countText + '</span></div>'
       + '<div class="table-wrap"><table><thead><tr><th>时间</th><th>releaseId</th><th>updateId</th><th>平台</th><th>大小</th><th>补丁</th><th>实际运行</th><th>状态</th><th>操作</th></tr></thead><tbody>'
       + (rows || '<tr><td colspan="9" class="empty">没有匹配的版本</td></tr>') + '</tbody></table></div>'
@@ -830,7 +1026,7 @@
         + '<td class="mono">' + esc(e.uid || '-') + '</td>'
         + '<td>' + esc(e.bucket === null || e.bucket === undefined ? '-' : e.bucket) + '</td>'
         + '<td>' + esc(e.served || '-') + '</td>'
-        + '<td class="mono">' + esc(fmtShort(e.updateId)) + '</td>'
+        + '<td class="mono" title="' + escAttr(e.updateId) + '">' + esc(e.updateId) + '</td>'
         + '<td><span class="tag ' + cls + '">' + esc(e.status) + '</span></td>'
         + '<td>' + esc(e.ms === undefined || e.ms === null ? '-' : e.ms + 'ms') + '</td>'
         + '<td><details><summary>JSON</summary><pre>' + raw + '</pre></details></td></tr>';
@@ -920,6 +1116,7 @@
     if (name === 'overview') {
       renderTrend();
       renderOverviewChannels();
+      renderStorage();
       renderOverviewEvents();
     } else if (name === 'channels') {
       renderChannels();
@@ -1254,6 +1451,14 @@
         }, null, e.target);
         return;
       }
+      // 孤儿体检：只读扫描，清理动作仍走命令行。
+      if (e.target.id === 'upOrphans') {
+        postAction({
+          action: 'scan-orphans',
+          runtimeVersion: state.runtimeVersion,
+        }, null, e.target);
+        return;
+      }
       // 测试桩的 target 不一定实现 closest，这里做能力检测，行为与真实浏览器一致。
       var gcBtn = e.target && e.target.closest
         ? e.target.closest('button[data-act="gc-release"]')
@@ -1356,8 +1561,37 @@
       });
     }
 
+    // 回收设置（设置页）：只提交有值的字段；切到「执行」需要二次确认。
+    var saveGc = $('#saveGc');
+    if (saveGc) {
+      saveGc.addEventListener('click', async function () {
+        var daysInput = $('#gcKeepDays');
+        var lastInput = $('#gcKeepLast');
+        var modeInput = $('#gcMode');
+        var body = {
+          action: 'set-gc-config',
+          runtimeVersion: state.runtimeVersion,
+        };
+        if (daysInput && String(daysInput.value).trim() !== '') body.keepDays = Number(daysInput.value);
+        if (lastInput && String(lastInput.value).trim() !== '') body.keepLast = Number(lastInput.value);
+        if (modeInput && !modeInput.disabled) body.gcMode = modeInput.value;
+        var switchingToApply = body.gcMode === 'apply' && (!state.gc || state.gc.mode !== 'apply');
+        var ok = await postAction(
+          body,
+          switchingToApply
+            ? '确认切换到「执行」模式？下一次定时回收将真实删除不在保留策略内的版本，且不可恢复。'
+            : null,
+          saveGc,
+        );
+        saveGc.disabled = false;
+        saveGc.textContent = '保存回收设置';
+        if (ok) syncGcSettings(true);
+      });
+    }
+
     // 首屏 hash 可能直接是 #settings，初始化时先回填一次。
     syncStopLossSettings(false);
+    syncGcSettings(false);
   }
 
   function setupTimer() {

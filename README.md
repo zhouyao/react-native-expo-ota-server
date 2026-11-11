@@ -55,7 +55,7 @@ Self-hosted [Expo Updates v1](https://docs.expo.dev/technical-specs/expo-updates
 | 灰度 | `sha256(uid)` 稳定分桶，支持百分比、白名单和 iOS / Android 独立阈值 |
 | 版本管理 | current / previous 指针、发布、提升、回滚、重新发布 |
 | 完整性 | manifest RSA-SHA256 签名，客户端内置公钥证书强校验 |
-| 可观测性 | 请求与客户端事件落盘，提供指标 API 和 Web 控制台 |
+| 可观测性 | 请求与客户端事件落盘，提供指标 API 和 Web 控制台；含版本文件明细（原始 / gzip）、数据目录构成、下载流量 Top 文件与孤儿文件体检 |
 | 运维安全 | 管理令牌（支持按 `release` / `rollout` / `stop-loss` / `gc` 权限位分权）、通道锁、请求幂等、审计日志、事件限流 |
 | 存储回收 | 提升 / 重发使用硬链接复用资产；`ota:gc` 按「天数 ∪ 数量」保留策略回收旧版本，联动清理补丁索引与孤儿补丁，支持 dry-run / 定时执行 / 控制台操作 |
 | 止损 / 崩溃感知 | 以「被下发 current 的设备（cohort）」统计启动失败率（应急启动 + watchdog 回退）与安装失败率；支持 `monitor` / `halt` / `rollback`、控制台「立即评估 / 紧急止血 / 恢复暂停前灰度」，以及运行时覆盖 `MIN_SAMPLES` 与 Webhook |
@@ -253,6 +253,7 @@ npm test
 │   │   ├── release-store.mjs    # 通道状态、发布锁与审计
 │   │   ├── release-files.mjs    # 硬链接复用（提升 / 重发不复制字节）
 │   │   ├── gc.mjs               # 保留策略、目录回收与补丁索引联动
+│   │   ├── integrity.mjs        # 孤儿文件体检与清理（引用集判定）
 │   │   ├── rollout.mjs          # uid 分桶与灰度决策
 │   │   ├── locks.mjs, lib.mjs   # 文件锁与公共工具
 │   │   ├── metrics.mjs          # 事件落盘与聚合
@@ -426,12 +427,12 @@ npm run ota:rollback -- --channel beta
 
 地址：`http://localhost:3000/dashboard`
 
-- **概览**：统计卡、7 天请求趋势、差分命中率与节省流量、通道状态（含实际运行版本 top）和最近事件。
+- **概览**：统计卡（通道 / 历史发布 / 磁盘占用 / 补丁库 / 7 天请求 / 差分命中率 / 节省流量 / 错误率）、7 天请求趋势、**数据目录构成**（releases / patches / embedded / metrics / audit 各自占用与占比）、通道状态（含实际运行版本 top）和最近事件。
 - **通道**：4 个通道以 Tab 切换，按 `development → canary → beta → production` 排序；每个面板包含版本状态、平台灰度、白名单、实际运行版本、止损健康度、发布操作和可展开的最近变更。实际运行版本来自客户端最近一次上报，按设备去重，并标注与 current / previous / 内置包的对应关系。
-- **版本**：发布产物列表、平台/通道/运行状态筛选、releaseId / updateId / 运行通道关键字搜索（空格分隔多关键词）、分页、current / previous 标记，以及每个版本的补丁数、体积与「实际运行」设备分布；另有「回收预览」与逐行「回收」（需 `gc` 权限，current / previous 版本禁用）。
-- **指标**：状态码、平台对比、通道明细、updateId 命中，以及按平台/通道的差分明细与回退原因。
+- **版本**：发布产物列表、平台/通道/运行状态筛选、releaseId / updateId / 运行通道关键字搜索（空格分隔多关键词）、分页、current / previous 标记，以及每个版本的补丁数、体积与「实际运行」设备分布。体积按「原始资产 + gzip 副本」分列，可展开查看文件数与最大文件明细；另有「回收预览」「孤儿体检」与逐行「回收」（需 `gc` 权限，current / previous 版本禁用）。
+- **指标**：状态码、平台对比、通道明细、updateId 命中，**下载流量**（原始 / gzip / 分片 / 差分补丁四类下发字节 + Top 10 文件 + 平均每次请求字节），以及按平台/通道的差分明细与回退原因。
 - **事件**：服务端筛选、分页和原始事件查看（差分原始事件类型为 `asset-patch`）。
-- **设置**：左侧分类切换「管理令牌 / 止损设置」。管理令牌只存本机 `localStorage`；止损设置可改 `MIN_SAMPLES` 与告警 Webhook，运行时生效并持久化到 `$OTA_DATA_DIR/system/stop-loss.json`；Webhook 只显示是否已配置与 origin，不回显明文。也可直接访问 `#settings`。
+- **设置**：左侧分类切换「管理令牌 / 止损设置 / 回收设置」。管理令牌只存本机 `localStorage`；止损设置可改 `MIN_SAMPLES` 与告警 Webhook，运行时生效并持久化到 `$OTA_DATA_DIR/system/stop-loss.json`；Webhook 只显示是否已配置与 origin，不回显明文。回收设置可改「保留天数 / 最少保留版本数 / 执行模式」，持久化到 `$OTA_DATA_DIR/system/gc.json`，页面上同时展示当前生效值、来源与上次执行结果。也可直接访问 `#settings`。
 
 写操作需要管理令牌，令牌只保存在浏览器 `localStorage`。可同时保存 iOS / Android 灰度、维护白名单、回滚、重新发布和提升历史版本。服务端写接口使用通道锁和 `requestId` 幂等保护，审计记录写入通道 `history` 和 `audit.jsonl`。多令牌可带权限位（如 `OTA_ADMIN_TOKENS="oncall:token:stop-loss"`），止血 / 恢复 / 止损设置只需 `stop-loss` 权限，发布类动作需要 `release` 或 `rollout`，回收旧版本需要 `gc`。
 
@@ -578,6 +579,18 @@ npm run ota:gc -- --rv 1 --apply --release <releaseId>     # 单条回收，受�
 npm run ota:gc -- --apply --json                           # 遍历全部 rv，供 CI 消费
 ```
 
+**孤儿文件体检**：孤儿指「没有任何 release metadata / 补丁索引 / 内置包记录引用」的文件，
+常见于发布中断、补丁重建后残留、手工删过 metadata。体检只读，控制台「版本 → 孤儿体检」可触发：
+
+```bash
+npm run ota:gc -- --rv 1 --scan-orphans            # 只体检
+npm run ota:gc -- --rv 1 --prune-orphans --apply   # 清理（持 rv 级锁）
+```
+
+判断依据是全部 release 的 `metadata.json` 引用集（`.gz` 副本按跟随原始文件处理）。
+任一版本缺少 metadata 或 `assetIndex` 时，体检返回「引用关系不确定」并**拒绝清理**，
+避免把无法判定的旧版本资产误删。
+
 服务端也可定时执行（默认关闭、默认只 dry-run，先看日志再接 `apply`）：
 
 | 变量 | 默认 | 说明 |
@@ -589,9 +602,15 @@ npm run ota:gc -- --apply --json                           # 遍历全部 rv，�
 | `OTA_GC_KEEP_DAYS` | `14` | 保留天数 |
 | `OTA_GC_KEEP_LAST` | `10` | 最少保留版本数 |
 
-控制台「版本」页提供「回收预览」与逐行「回收」按钮，对应
-`POST /api/admin/actions` 的 `gc-releases` 动作，需要 `gc` 权限位；
-`current` / `previous` 版本在前端即禁用，服务端仍会二次校验保护集。
+控制台有两处入口，都需要 `gc` 权限位：
+
+- **版本页**：「回收预览」与逐行「回收」，对应 `POST /api/admin/actions` 的 `gc-releases`；
+  `current` / `previous` 版本在前端即禁用，服务端仍会二次校验保护集。
+- **设置 → 回收设置**：只能配置「保留天数」「最少保留版本数」和执行模式，写入
+  `$OTA_DATA_DIR/system/gc.json`，优先级高于环境变量；定时回收和版本页预览都会沿用，
+  避免「设置页改了 30 天、预览仍按 14 天算」。
+  `OTA_GC_ENABLED` 是硬闸门：未开启时无法切到「执行」模式，读取时也会强制回落 `dry-run`；
+  最少保留版本数下限为 3，`keepDays=0` 表示不按天数保留。
 
 > **回收不可恢复**。资产 URL 里带 `releaseId` 且响应头是 `immutable`，删掉目录后，
 > 仍持有旧 manifest 的设备会下载失败——`keep-days` 就是给这个场景留的缓冲；
@@ -651,6 +670,8 @@ manifest 的 `metadata` 会返回 `channel`、`releaseId`、`rollout`、`served`
 | `evaluate-stop-loss` | 只读 | 立即评估健康度，返回当前策略与样本缺口 |
 | `set-stop-loss-config` | `stop-loss` | 修改运行时 `MIN_SAMPLES` / Webhook |
 | `gc-releases` | `gc` | 回收旧 release：`releaseIds` 指定单条，`apply=false` 为预览；保护集由服务端二次校验 |
+| `set-gc-config` | `gc` | 修改运行时 `keepDays` / `keepLast` / `gcMode`（`apply` 需服务端已开启 `OTA_GC_ENABLED`） |
+| `scan-orphans` | `gc` | 孤儿文件体检（只读）：返回孤儿数量、体积与最大的几个文件；清理走 `ota:gc --prune-orphans` |
 
 ### 环境变量
 
@@ -678,7 +699,7 @@ manifest 的 `metadata` 会返回 `channel`、`releaseId`、`rollout`、`served`
 | `OTA_PATCH_MAX_BASES` | 发布时预生成的 base 版本数，默认 `5` |
 | `OTA_BSDIFF_BIN` / `OTA_BSPATCH_BIN` | 发布期 `bsdiff` / `bspatch` 命令路径 |
 | `OTA_REGISTER_EMBEDDED` | dev 构建后自动注册内置包，设为 `0` 关闭 |
-| `OTA_GC_ENABLED` / `MODE` / `INTERVAL_MS` / `INITIAL_DELAY_MS` / `KEEP_DAYS` / `KEEP_LAST` | 存储回收配置，默认关闭且只 dry-run；详见[数据保留与 GC](#数据保留与-gc) |
+| `OTA_GC_ENABLED` / `MODE` / `INTERVAL_MS` / `INITIAL_DELAY_MS` / `KEEP_DAYS` / `KEEP_LAST` | 存储回收配置，默认关闭且只 dry-run；其中 `KEEP_DAYS` / `KEEP_LAST` / `MODE` 可被控制台「设置 → 回收设置」覆盖，`ENABLED` / 间隔 / 启动延迟仅由环境变量决定。详见[数据保留与 GC](#数据保留与-gc) |
 
 **客户端构建**
 
@@ -717,6 +738,9 @@ npm test
 - 单区间 Range 的 `206` / `416`、`If-Range` 降级、HEAD 探测、gzip/差分绕过与分片拼接还原
 - 止损 cohort 统计、halt / restore 语义、重复止血幂等、运行时覆盖优先级与 Webhook 平台消息体
 - GC 保护集（通道指针 / keep-last / keep-days / patch base）、dry-run 只读、二次校验跳过、补丁索引与孤儿补丁联动、并发串行、审计归属 `system`
+- 回收设置运行时覆盖：优先级（覆盖 > 环境变量）、非法值拒绝、未开启 `OTA_GC_ENABLED` 时强制 `dry-run` 且禁止切执行模式、CLI 与看板共用同一份生效值
+- 下载流量聚合：原始 / gzip / 分片 / 补丁四类字节、Top 文件排序、平台筛选与时间窗口
+- 孤儿文件体检：引用集判定（含 `.gz` 跟随）、metadata 缺失时降级为不可清理、只删孤儿、审计归属 `system`
 - 硬链接复用：inode 一致、删除源目录后仍可读、不支持硬链接时回退拷贝
 
 ## 生产部署
@@ -730,8 +754,8 @@ npm test
 5. 只运行一个写入实例；当前通道锁和 JSON 数据存储不做多副本协调。
 6. 在 App Store / Google Play 发布前替换示例 Bundle ID、包名和签名证书。
 7. 按需启用止损：先 `OTA_STOP_LOSS_ENABLED=true` + `OTA_STOP_LOSS_MODE=monitor` 配好告警 Webhook，观察阈值后再切 `halt`。
-8. 备份 `services/ota/updates` 时一并包含 `system/stop-loss.json`（控制台写入的运行时止损设置）；多令牌按需分配 `release` / `rollout` / `stop-loss` / `gc` 权限位。
-9. 存储回收：先用 `npm run ota:gc -- --rv <rv>` 观察待删清单，再配置定时任务（如每天一次 `--apply`），或开启 `OTA_GC_ENABLED=true` 并先以 `OTA_GC_MODE=dry-run` 跑一周；`keep-days` 至少覆盖客户端最长离线时间。
+8. 备份 `services/ota/updates` 时一并包含 `system/stop-loss.json` 与 `system/gc.json`（控制台写入的运行时止损 / 回收设置）；多令牌按需分配 `release` / `rollout` / `stop-loss` / `gc` 权限位。
+9. 存储回收：先用 `npm run ota:gc -- --rv <rv>` 观察待删清单，再配置定时任务（如每天一次 `--apply`），或开启 `OTA_GC_ENABLED=true` 并先以 `OTA_GC_MODE=dry-run` 跑一周；`keep-days` 至少覆盖客户端最长离线时间。保留策略可留给控制台「设置 → 回收设置」调整，但 `OTA_GC_ENABLED` 必须在部署层打开，「执行」模式才可选。
 
 ### 安全说明
 
@@ -739,7 +763,7 @@ npm test
 - `/api/events` 是公网写入口，已实现限流和 16 KB 请求体限制，生产仍建议在反向代理层增加额外限制。
 - 管理令牌只存在浏览器本地，换浏览器需要重新输入；未配置令牌时管理写接口一律返回 `403`。
 - 多令牌可用 `OTA_ADMIN_TOKENS` 第三段分配权限位（`release` / `rollout` / `stop-loss` / `gc`）；建议给 on-call 只发 `stop-loss` 窄令牌，`gc` 单独发给负责容量的人（删除不可恢复）。
-- 控制台「设置」保存的 Webhook 只在看板回显 origin、不返回完整地址；运行时覆盖文件 `system/stop-loss.json` 含 Webhook（可能带 token），需限制数据目录权限并谨慎备份。
+- 控制台「设置」保存的 Webhook 只在看板回显 origin、不返回完整地址；运行时覆盖文件 `system/stop-loss.json` 含 Webhook（可能带 token），需限制数据目录权限并谨慎备份。`system/gc.json` 只含保留策略与执行模式，不含凭据。
 - 生产构建必须关闭 `EXPO_PUBLIC_ENABLE_CHANNEL_SWITCH`，避免关闭防砖保护。
 - 不要提交 `.env`、私钥、Provisioning Profile、Keystore 或真实用户 uid；`apps/mobile/certs/certificate.pem` 是公开验签证书，可以提交。
 
@@ -748,7 +772,7 @@ npm test
 **架构与运维**
 
 - 单机部署：通道状态是本地 JSON，幂等缓存与请求队列是进程内内存；文件锁依赖共享文件系统，只能在同一挂载卷内互斥，不支持多副本 / 多机并发写。
-- 事件与指标只写本地 `events.jsonl`（5 MB 轮转），指标按 7 天窗口聚合；没有长期存储或外部监控对接，告警仅支持 Webhook（fire-and-forget，无重试队列）。
+- 事件与指标只写本地 `events.jsonl`（5 MB 轮转），指标按 7 天窗口聚合；没有长期存储或外部监控对接，告警仅支持 Webhook（fire-and-forget，无重试队列）。资产请求现在全量落盘（含 `bytes` / `encoding` / `range`）以支撑下载流量统计，流量越大日志写入越多；早期事件没有 `bytes` 字段，因此流量数据从升级后开始累计。
 - 旧 release 默认不自动回收：需要显式执行 `npm run ota:gc` 或开启 `OTA_GC_ENABLED`；提升 / 重发已改为硬链接复用，不再复制字节。备份工具需保留硬链接（`rsync -H`）或接受展开后的体积。
 - 未包含原生崩溃采集、符号化、CI/CD 或容器编排配置。
 

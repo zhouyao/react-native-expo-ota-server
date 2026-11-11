@@ -131,6 +131,38 @@ function patchRates(stats) {
   };
 }
 
+/**
+ * 下载流量口径：只统计「真正下发字节」。
+ * - asset 事件记 content-length（206 分片记的是分片长度）；
+ * - asset-patch 事件记补丁长度（客户端还会自行 bspatch，不需要全量下载）；
+ * - HEAD / 304 / 失败响应没有响应体，只计入 requests。
+ */
+function emptyTransfer() {
+  return {
+    requests: 0,
+    bytes: 0,
+    rangeRequests: 0,
+    byFile: new Map(),
+    byKind: Object.fromEntries(
+      ['raw', 'gzip', 'range', 'patch'].map((kind) => [kind, { requests: 0, bytes: 0 }]),
+    ),
+  };
+}
+
+function transferSummary(transfer) {
+  const byFile = [...transfer.byFile.values()]
+    .sort((a, b) => b.bytes - a.bytes)
+    .slice(0, 10);
+  return {
+    requests: transfer.requests,
+    bytes: transfer.bytes,
+    rangeRequests: transfer.rangeRequests,
+    uniqueFiles: transfer.byFile.size,
+    byKind: transfer.byKind,
+    byFile,
+  };
+}
+
 function emptyPlatformGroup() {
   return {
     total: 0,
@@ -191,6 +223,20 @@ export async function aggregateMetrics(
   let assets = 0;
   let clientEvents = 0;
   let errors = 0;
+  const transfer = emptyTransfer();
+  const bumpTransfer = (kind, file, bytes) => {
+    const size = Number(bytes) || 0;
+    transfer.requests += 1;
+    transfer.bytes += size;
+    const bucket = transfer.byKind[kind] || (transfer.byKind[kind] = { requests: 0, bytes: 0 });
+    bucket.requests += 1;
+    bucket.bytes += size;
+    if (!file) return;
+    const entry = transfer.byFile.get(file) || { file, requests: 0, bytes: 0 };
+    entry.requests += 1;
+    entry.bytes += size;
+    transfer.byFile.set(file, entry);
+  };
 
   const channelEntry = (name) => {
     if (!byChannel[name]) {
@@ -240,10 +286,15 @@ export async function aggregateMetrics(
         patch.reasons[reason] = (patch.reasons[reason] || 0) + 1;
       }
       if (filter && patchPlatform !== filter) continue;
+      // 补丁响应同样占用了真实的下行字节，计入总流量，但在 byKind 里单独可见。
+      bumpTransfer('patch', event.file, event.patchSize);
       bumpPatch(patch, event);
-      const patchChannel = event.channel || '-';
-      patch.byChannel[patchChannel] ||= emptyPatchStats();
-      bumpPatch(patch.byChannel[patchChannel], event);
+      // 原生层 asset 请求通常不带 channel，无法按通道归因；
+      // 不伪造 '-' 通道，这类请求只保留在汇总 / byPlatform / byDay 里。
+      if (event.channel) {
+        patch.byChannel[event.channel] ||= emptyPatchStats();
+        bumpPatch(patch.byChannel[event.channel], event);
+      }
       const patchDay = dayKey(event.at);
       patch.byDay[patchDay] ||= emptyPatchStats();
       bumpPatch(patch.byDay[patchDay], event);
@@ -319,6 +370,13 @@ export async function aggregateMetrics(
     }
 
     if (filter && key !== filter) continue;
+
+    // 下载流量：只累加真正下发字节，失败响应仅有 requests。
+    if (isAsset) {
+      const kind = event.range ? 'range' : event.encoding === 'gzip' ? 'gzip' : 'raw';
+      bumpTransfer(kind, event.file, event.bytes);
+      if (event.range) transfer.rangeRequests += 1;
+    }
 
     // 以下沿用旧口径：asset 不进 byChannel / byDay，byDay 只统计 manifest。
     if (event.uid) {
@@ -428,6 +486,7 @@ export async function aggregateMetrics(
     byDay: dayEntries(byDay),
     versions,
     running,
+    transfer: transferSummary(transfer),
     patch: {
       ...patchRates(patch),
       reasons: patch.reasons,

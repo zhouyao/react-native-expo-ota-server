@@ -1,9 +1,10 @@
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CLI_OPERATOR } from '../services/ota/src/config.mjs';
+import { CLI_OPERATOR, gcConfig } from '../services/ota/src/config.mjs';
 import { runtimeVersions } from '../services/ota/src/release-store.mjs';
 import { applyGc, planGc } from '../services/ota/src/gc.mjs';
+import { pruneOrphans, scanOrphans } from '../services/ota/src/integrity.mjs';
 
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(scriptsDir, '..');
@@ -18,6 +19,8 @@ function parseArgs(argv) {
     patchBases: null,
     apply: false,
     json: false,
+    scanOrphans: false,
+    pruneOrphans: false,
     releaseIds: [],
     operator: process.env.OTA_OPERATOR || CLI_OPERATOR || 'cli',
     via: 'cli',
@@ -36,6 +39,11 @@ function parseArgs(argv) {
       args.patchBases = Number(next());
     } else if (key === '--release') {
       args.releaseIds.push(String(next()));
+    } else if (key === '--scan-orphans') {
+      args.scanOrphans = true;
+    } else if (key === '--prune-orphans') {
+      args.pruneOrphans = true;
+      args.scanOrphans = true;
     } else if (key === '--apply') {
       args.apply = true;
     } else if (key === '--dry-run') {
@@ -52,10 +60,12 @@ function parseArgs(argv) {
       console.log(`用法: npm run ota:gc -- [选项]
 
   --rv <rv>               只处理指定 runtimeVersion（默认遍历全部）
-  --keep-days <n>         保留最近 n 天（默认 14，0 表示不按天数保留）
-  --keep-last <n>         至少保留最近 n 个版本（默认 10，最小 1）
+  --keep-days <n>         保留最近 n 天（默认取生效配置，出厂 14；0 表示不按天数保留）
+  --keep-last <n>         至少保留最近 n 个版本（默认取生效配置，出厂 10，下限 3）
   --patch-bases <n>       额外保留最近 n 个差分 base（默认 OTA_PATCH_MAX_BASES）
   --release <id>          只回收指定版本，可重复；受保护版本会被拒绝
+  --scan-orphans          额外做孤儿文件体检（没有任何版本 / 补丁 / 内置包引用）
+  --prune-orphans         清理孤儿文件，需要同时传 --apply；引用关系不确定时拒绝执行
   --dry-run               只输出计划（默认行为）
   --apply                 真正删除文件
   --json                  输出结构化结果，供 CI / 控制台消费
@@ -95,11 +105,16 @@ function formatBytes(bytes) {
   return `${value} B`;
 }
 
+/**
+ * 未显式传参时用「控制台覆盖 > 环境变量」的生效值，
+ * 否则设置页把保留期改成 30 天后，版本页的预览仍按 14 天计算，容易误判。
+ */
 function optionsOf(args) {
+  const cfg = gcConfig();
   return {
-    keepDays: args.keepDays ?? undefined,
-    keepLast: args.keepLast ?? undefined,
-    patchBases: args.patchBases ?? undefined,
+    keepDays: Number.isFinite(args.keepDays) ? args.keepDays : cfg.keepDays,
+    keepLast: Number.isFinite(args.keepLast) ? args.keepLast : cfg.keepLast,
+    patchBases: Number.isFinite(args.patchBases) ? args.patchBases : undefined,
   };
 }
 
@@ -157,6 +172,23 @@ function printPlan(plan, dryRun) {
   }
 }
 
+function printOrphanReport(report) {
+  if (!report.safe) {
+    console.log(
+      `[gc] 孤儿体检降级：版本 ${report.unreadableReleases.join(', ')} 缺少 metadata / assetIndex，` +
+        '引用关系不确定，禁止据此清理',
+    );
+  }
+  console.log(
+    `[gc] 孤儿文件：${report.totalFiles} 个 / ${formatBytes(report.totalBytes)}` +
+      `（releases ${report.releaseOrphans.length} · patches ${report.patchOrphans.length}` +
+      ` · embedded ${report.embeddedOrphans.length}）`,
+  );
+  for (const item of [...report.releaseOrphans, ...report.patchOrphans, ...report.embeddedOrphans].slice(0, 10)) {
+    console.log(`  ${item.file}  ${formatBytes(item.bytes)}`);
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const versions = await resolveRuntimeVersions(args.runtimeVersion);
@@ -175,39 +207,64 @@ async function main() {
 
     if (!args.json) printPlan(plan, dryRun);
 
-    if (dryRun) {
-      results.push({ dryRun: true, plan });
+    let result = null;
+    if (!dryRun && plan.candidates.length > 0) {
+      result = await applyGc(runtimeVersion, plan, {
+        operator: args.operator,
+        via: args.via,
+        requestId: args.requestId,
+      });
+      failedCount += result.failed.length;
       if (!args.json) {
-        console.log('[gc] dry-run：未删除任何文件（加 --apply 执行）');
+        console.log(
+          `[gc] 已回收 ${result.removed.length} 个 / ${formatBytes(result.reclaimedBytes)}` +
+            `，补丁条目 ${result.patch.droppedEntries} 条 / 文件 ${result.patch.droppedFiles} 个`,
+        );
+        for (const item of result.failed) {
+          console.error(`[gc] 删除失败: ${item.releaseId} -> ${item.error}`);
+        }
+        for (const item of result.skipped) {
+          console.log(`[gc] 跳过 ${item.releaseId}：${item.reason}`);
+        }
       }
-      continue;
+    } else if (!dryRun && !args.json) {
+      console.log('[gc] 没有需要回收的版本');
     }
 
-    if (plan.candidates.length === 0) {
-      results.push({ dryRun: false, plan, result: null });
-      if (!args.json) console.log('[gc] 没有需要回收的版本');
-      continue;
+    // 孤儿体检放在回收之后：先删版本，再按最新引用关系判断孤儿。
+    let orphans = null;
+    let pruned = null;
+    if (args.scanOrphans || args.pruneOrphans) {
+      orphans = await scanOrphans(runtimeVersion);
+      if (!args.json) printOrphanReport(orphans);
+      if (args.pruneOrphans) {
+        if (!args.apply) {
+          if (!args.json) console.log('[gc] 孤儿清理需要 --apply（当前只是体检）');
+        } else if (orphans.totalFiles === 0) {
+          if (!args.json) console.log('[gc] 没有孤儿文件需要清理');
+        } else {
+          pruned = await pruneOrphans(runtimeVersion, orphans, {
+            operator: args.operator,
+            via: args.via,
+            requestId: args.requestId,
+          });
+          failedCount += pruned.failed.length;
+          if (!args.json) {
+            console.log(
+              `[gc] 已清理孤儿文件 ${pruned.removed.length} 个 / ${formatBytes(pruned.bytes)}`,
+            );
+            for (const item of pruned.failed) {
+              console.error(`[gc] 孤儿删除失败: ${item.file} -> ${item.error}`);
+            }
+          }
+        }
+      }
     }
 
-    const result = await applyGc(runtimeVersion, plan, {
-      operator: args.operator,
-      via: args.via,
-      requestId: args.requestId,
-    });
-    failedCount += result.failed.length;
-    results.push({ dryRun: false, plan, result });
-    if (!args.json) {
-      console.log(
-        `[gc] 已回收 ${result.removed.length} 个 / ${formatBytes(result.reclaimedBytes)}` +
-          `，补丁条目 ${result.patch.droppedEntries} 条 / 文件 ${result.patch.droppedFiles} 个`,
-      );
-      for (const item of result.failed) {
-        console.error(`[gc] 删除失败: ${item.releaseId} -> ${item.error}`);
-      }
-      for (const item of result.skipped) {
-        console.log(`[gc] 跳过 ${item.releaseId}：${item.reason}`);
-      }
+    if (dryRun && !args.json) {
+      console.log('[gc] dry-run：未删除任何文件（加 --apply 执行）');
     }
+    results.push({ dryRun, plan, result, orphans, pruned });
   }
 
   if (args.json) {

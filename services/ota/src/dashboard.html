@@ -50,7 +50,7 @@ nav.tabs a.active .count{background:#dbeafe;color:#1e40af}
 .settings-panel h3{font-size:14px;margin:0 0 4px}
 .settings-panel>p{font-size:12px;color:#6b7280;margin:0 0 14px}
 .settings-panel label{display:block;font-size:12px;color:#6b7280;margin:10px 0}
-.settings-panel label input{display:block;width:100%;margin-top:5px;padding:7px 9px;border:1px solid #d1d5db;border-radius:8px}
+.settings-panel label input,.settings-panel label select{display:block;width:100%;margin-top:5px;padding:7px 9px;border:1px solid #d1d5db;border-radius:8px;background:#fff}
 .settings-panel label.check{display:flex;align-items:center;gap:6px;margin:6px 0 10px}
 .settings-panel label.check input{display:inline-block;width:auto;margin:0}
 .settings-panel .hint{font-size:12px;color:#6b7280;margin-top:8px;line-height:1.5}
@@ -60,13 +60,26 @@ nav.tabs a.active .count{background:#dbeafe;color:#1e40af}
   .settings-nav{flex-direction:row;border-right:none;border-bottom:1px solid #e5e7eb;padding:0 0 8px;overflow-x:auto}
   .settings-nav-item{white-space:nowrap}
 }
+/* 版本页：文件明细（<details> 展开） */
+td details{margin-top:4px}
+td details summary{cursor:pointer;font-size:12px;color:#1d4ed8}
+.rel-files{margin-top:6px;font-size:12px}
+.rel-files table{margin-top:6px;min-width:0}
+.rel-files th,.rel-files td{padding:4px 6px;white-space:nowrap}
 /* 概览 */
-.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:16px}
+.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}
 .stat{padding:12px 16px;margin:0;display:flex;flex-direction:column;justify-content:center}
 .stat b{display:block;font-size:22px;line-height:1.25;font-variant-numeric:tabular-nums}
+.stat b.tone-bad{color:#dc2626}
+.stat b.tone-blue{color:#1d4ed8}
+.stat b.tone-ok{color:#059669}
 .stat span{font-size:12px;color:#6b7280}
-.overview{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,.8fr);gap:16px;margin-bottom:16px}
-.overview .stat{height:100%}
+.overview{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-bottom:16px}
+.overview .stat{height:100%;min-width:0}
+.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;align-items:start}
+.grid-2>.stat{margin:0;min-width:0}
+.panel{background:#fff;border:1px solid #e5e7eb;border-radius:var(--radius);padding:16px;margin-bottom:16px;box-shadow:var(--shadow)}
+.panel h2{margin-top:0}
 /* 表格 */
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #f3f4f6;vertical-align:top}
@@ -103,7 +116,7 @@ code{font-family:ui-monospace,Menlo,monospace}
 .ch-versions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:12px}
 .ch-version{display:flex;align-items:center;gap:7px;min-width:0;padding:7px 9px;background:#f9fafb;border-radius:8px;font-size:11px;color:#6b7280}
 .ch-version-label{flex:0 0 auto}
-.ch-release{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#374151}
+.ch-release{min-width:0;flex:1;word-break:break-all;color:#374151}
 .ch-version .mini{flex:0 0 auto;margin-left:auto}
 .ch-body{display:grid;gap:12px}
 .ch-section{padding:12px;background:#fbfcfe;border:1px solid #f3f4f6;border-radius:9px}
@@ -162,6 +175,7 @@ pre{white-space:pre-wrap;word-break:break-all;font-size:11px;background:#f9fafb;
 @media(max-width:900px){
   .stats{grid-template-columns:repeat(2,minmax(0,1fr))}
   .ch-versions{grid-template-columns:1fr}
+  .grid-2{grid-template-columns:1fr}
 }
 @media(max-width:760px){
   :root{--gutter:12px}
@@ -233,9 +247,15 @@ pre{white-space:pre-wrap;word-break:break-all;font-size:11px;background:#f9fafb;
         <div id="overviewChannels"></div>
       </div>
     </div>
-    <div class="stat">
-      <h2>最近事件 <span class="meta">（最近 5 条，不受事件页筛选影响）</span></h2>
-      <div id="overviewEvents"></div>
+    <div class="overview">
+      <div class="stat">
+        <h2>数据目录 <span class="meta">按实际磁盘占用；releases 已按 inode 去重</span></h2>
+        <div id="storage"></div>
+      </div>
+      <div class="stat">
+        <h2>最近事件 <span class="meta">（最近 5 条，不受事件页筛选影响）</span></h2>
+        <div id="overviewEvents"></div>
+      </div>
     </div>
   </section>
 
@@ -260,11 +280,12 @@ pre{white-space:pre-wrap;word-break:break-all;font-size:11px;background:#f9fafb;
   </section>
 
   <section data-tab-panel="settings" hidden>
-    <h2>设置 <span class="meta">令牌只保存在本机浏览器；止损设置写入服务端并持久化</span></h2>
+    <h2>设置 <span class="meta">令牌只保存在本机浏览器；止损 / 回收设置写入服务端并持久化</span></h2>
     <div class="settings-layout">
       <nav class="settings-nav" id="settingsNav" aria-label="设置分类">
         <button type="button" class="settings-nav-item active" data-settings-tab="token" aria-selected="true">管理令牌</button>
         <button type="button" class="settings-nav-item" data-settings-tab="stop-loss" aria-selected="false">止损设置</button>
+        <button type="button" class="settings-nav-item" data-settings-tab="gc" aria-selected="false">回收设置</button>
       </nav>
       <div class="settings-content">
         <div class="settings-panel" data-settings-panel="token">
@@ -311,6 +332,51 @@ pre{white-space:pre-wrap;word-break:break-all;font-size:11px;background:#f9fafb;
             <span id="stopLossHint" class="meta"></span>
           </div>
           <div class="hint" id="slSource"></div>
+        </div>
+
+        <div class="settings-panel" data-settings-panel="gc" hidden>
+          <h3>回收设置</h3>
+          <p>控制台设置优先于环境变量，下一次定时回收即生效；这里只开放「保留天数」「最少保留版本数」和执行模式。</p>
+          <label>保留天数
+            <input id="gcKeepDays" type="number" min="0" max="3650" step="1" placeholder="14">
+          </label>
+          <div class="hint" style="margin:-4px 0 10px">
+            发布超过该天数的版本才可能被回收，默认 <code>14</code>，<code>0</code> 表示不按天数保留。<br>
+            这个窗口是给「已经下载了旧 manifest、但还没开始拉资产」的设备留的缓冲：资产 URL 里带 <code>releaseId</code>，
+            目录删掉后这类请求会 404。建议不小于客户端的最长离线时间。
+          </div>
+          <label>最少保留版本数（至少 3）
+            <input id="gcKeepLast" type="number" min="3" max="1000" step="1" placeholder="10">
+          </label>
+          <div class="hint" style="margin:-4px 0 10px">
+            无论多老，最近 N 个版本一定保留，默认 <code>10</code>，下限 <code>3</code>（留出回滚与观察余量）。<br>
+            与「保留天数」是并集：任一条件命中即保留。<br>
+            注意：差分补丁需要最近若干版本作为 base，因此实际保留数不会少于
+            <code>OTA_PATCH_MAX_BASES</code>（默认 5）。设成 3 时，系统仍会保留 5 个，
+            上方会直接显示实际生效值。
+          </div>
+          <label>执行模式
+            <select id="gcMode">
+              <option value="dry-run">预览（只记录，不删除）</option>
+              <option value="apply">执行（真实删除，不可恢复）</option>
+            </select>
+          </label>
+          <div class="hint" style="margin:-4px 0 10px">
+            自动回收需要在服务端启动时设置 <code>OTA_GC_ENABLED=true</code>，否则这里只能改保留策略，
+            真实回收只能走版本页的逐条「回收」或命令行 <code>npm run ota:gc -- --apply</code>。
+            切换为「执行」后，下一次定时任务就会按上面的策略删除目录。
+          </div>
+          <div class="inline">
+            <button type="button" id="saveGc">保存回收设置</button>
+            <span id="gcHint" class="meta"></span>
+          </div>
+          <div class="hint" id="gcSource"></div>
+          <div class="hint">
+            <b>不会被回收</b>：各通道 current / previous 指针指向的版本，以及最近若干差分 base。<br>
+            <b>联动清理</b>：引用已删版本的补丁索引条目会被移除，不再被引用的 <code>.bsdiff</code> 一并回收；
+            已注册的内置包（<code>embedded/</code>）不受影响。<br>
+            <b>不是撤回</b>：CDN 已缓存的副本仍可访问，回收释放的是源站空间。
+          </div>
         </div>
       </div>
     </div>

@@ -3,11 +3,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   ADMIN_TOKENS,
+  gcConfig,
   hasScope,
   stopLossConfig,
+  writeGcOverride,
   writeStopLossOverride,
 } from './config.mjs';
 import {
+  SYSTEM_CHANNEL,
   appendAudit,
   auditEntry,
   channelLockFile,
@@ -22,6 +25,7 @@ import {
   rememberRequest,
   withLock,
 } from './locks.mjs';
+import { scanOrphans } from './integrity.mjs';
 import { applyHalt, evaluateChannelHealth, restoreRollout } from './stop-loss.mjs';
 
 // services/ota/src → 项目根需要上三级。
@@ -77,6 +81,8 @@ const ACTION_SCOPES = {
   'restore-rollout': 'stop-loss',
   'set-stop-loss-config': 'stop-loss',
   'gc-releases': 'gc',
+  'set-gc-config': 'gc',
+  'scan-orphans': 'gc',
 };
 
 export function requiredScope(action) {
@@ -178,7 +184,7 @@ async function saveStopLossSettings(input, { operator, via, requestId, source, r
   const cfg = stopLossConfig();
   const entry = auditEntry({
     action: 'set-stop-loss-config',
-    channel: 'system',
+    channel: SYSTEM_CHANNEL,
     operator,
     via,
     requestId,
@@ -191,6 +197,53 @@ async function saveStopLossSettings(input, { operator, via, requestId, source, r
   if (rv) await appendAudit(rv, entry);
   const result = {
     message: `止损设置已更新：MIN_SAMPLES=${cfg.minSamples}，Webhook ${cfg.webhook ? '已配置' : '未配置'}`,
+    operator,
+    duplicated: false,
+  };
+  if (requestId) rememberRequest(`req:${requestId}`, result);
+  return result;
+}
+
+const GC_MODE_LABEL = {
+  'dry-run': '预览（只记录不删除）',
+  apply: '执行（真实删除）',
+};
+
+/**
+ * 回收设置（保留天数 / 最少保留版本数 / 执行模式）。不针对通道，因此不占通道锁；
+ * 写入 $OTA_DATA_DIR/system/gc.json，优先级高于环境变量，定时任务下次执行即生效。
+ * mode=apply 需要服务端已开启 OTA_GC_ENABLED（在 writeGcOverride 内校验）。
+ */
+async function saveGcSettings(input, { operator, via, requestId, source, rv }) {
+  if (requestId) {
+    const cached = recallRequest(`req:${requestId}`);
+    if (cached) return { ...cached, duplicated: true };
+  }
+  await writeGcOverride(
+    { keepDays: input.keepDays, keepLast: input.keepLast, mode: input.gcMode },
+    { operator },
+  );
+  const cfg = gcConfig();
+  const entry = auditEntry({
+    action: 'set-gc-config',
+    channel: SYSTEM_CHANNEL,
+    operator,
+    via,
+    requestId,
+    params: {
+      keepDays: cfg.keepDays,
+      keepLast: cfg.keepLast,
+      mode: cfg.mode,
+      enabled: cfg.enabled,
+    },
+    source,
+  });
+  if (rv) await appendAudit(rv, entry);
+  const result = {
+    message:
+      `回收设置已更新：保留 ${cfg.keepDays} 天 / 最少 ${cfg.keepLast} 个版本 / ` +
+      `模式 ${GC_MODE_LABEL[cfg.mode] || cfg.mode}` +
+      (cfg.enabled ? '' : '（OTA_GC_ENABLED 未开启，仅手动回收可用）'),
     operator,
     duplicated: false,
   };
@@ -250,6 +303,34 @@ export async function performAdminAction(input, context = {}) {
   // 全局设置不针对通道，提前返回，避免占用通道锁。
   if (input.action === 'set-stop-loss-config') {
     return saveStopLossSettings(input, { operator, via, requestId, source, rv });
+  }
+
+  // 回收设置同理：只改保留策略，不碰具体通道。
+  if (input.action === 'set-gc-config') {
+    return saveGcSettings(input, { operator, via, requestId, source, rv });
+  }
+
+  // 孤儿体检只读：不改状态、不写审计，参照 evaluate-stop-loss 的处理方式。
+  if (input.action === 'scan-orphans') {
+    const report = await scanOrphans(rv);
+    const top = [
+      ...report.releaseOrphans,
+      ...report.patchOrphans,
+      ...report.embeddedOrphans,
+    ]
+      .sort((a, b) => b.bytes - a.bytes)
+      .slice(0, 3)
+      .map((item) => `${item.file}（${item.bytes}B）`);
+    const message = report.safe
+      ? `孤儿文件体检：${report.totalFiles} 个 / ${report.totalBytes} 字节` +
+        `（releases ${report.releaseOrphans.length} · patches ${report.patchOrphans.length}` +
+        ` · embedded ${report.embeddedOrphans.length}）` +
+        (top.length ? `，最大：${top.join('、')}` : '') +
+        '；清理请执行 npm run ota:gc -- --rv ' +
+        rv +
+        ' --prune-orphans --apply'
+      : `引用关系不确定：版本 ${report.unreadableReleases.join(', ')} 缺少 metadata / assetIndex，已跳过清理判断`;
+    return { message, operator, duplicated: false };
   }
 
   // GC 同样不针对通道：脚本内部持 runtimeVersion 级锁（与提升 / 重发互斥），

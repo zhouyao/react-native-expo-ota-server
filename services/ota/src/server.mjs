@@ -158,6 +158,7 @@ export async function handle(req, res) {
       const state = await buildDashboardState(
         url.searchParams.get('rv') || '',
         dashboardQuery(url),
+        { gc: gcState },
       );
       return send(res, {
         headers: {
@@ -189,6 +190,7 @@ export async function handle(req, res) {
       const state = await buildDashboardState(
         url.searchParams.get('rv') || '',
         dashboardQuery(url),
+        { gc: gcState },
       );
       return send(res, {
         headers: {
@@ -285,6 +287,8 @@ export async function handle(req, res) {
             keepDays: payload.keepDays,
             keepLast: payload.keepLast,
             patchBases: payload.patchBases,
+            // 回收设置（set-gc-config）：与 halt 的 mode 区分开，避免语义串味。
+            gcMode: payload.gcMode,
           },
           { operator, via: 'dashboard', requestId, source },
         );
@@ -320,7 +324,11 @@ export async function handle(req, res) {
           gc: {
             enabled: gcState.enabled,
             mode: gcState.mode,
+            keepDays: gcState.keepDays,
+            keepLast: gcState.keepLast,
             lastRunAt: gcState.lastRunAt,
+            lastRemoved: gcState.lastRemoved,
+            lastBytes: gcState.lastBytes,
             lastError: gcState.lastError,
           },
         }),
@@ -481,16 +489,26 @@ export async function handle(req, res) {
           );
         }
       }
-      if (response.status >= 400) {
-        // 资产请求由 expo-updates 原生层发起，不带 expo-platform，无法归因到设备平台；
-        // 显式写 null，聚合时归入「未标记」兜底分组而不是某种设备平台。
+      // 成功与失败的资产请求都落盘：下载流量（bytes）与 gzip / 分片命中需要这些数据。
+      // 226 补丁走独立的 asset-patch 事件（补丁字节在那边统计），这里跳过避免重复计数。
+      if (!response.patch) {
+        const headOnly = req.method === 'HEAD';
         recordEvent(url.searchParams.get('rv') || '', {
           type: 'asset',
           channel: channel === '-' ? null : channel,
           status: response.status,
           releaseId: url.searchParams.get('release'),
           file: url.searchParams.get('file'),
+          // 资产请求由 expo-updates 原生层发起，不带 expo-platform，无法归因到设备平台；
+          // 显式写 null，聚合时归入「未标记」兜底分组而不是某种设备平台。
           platform: null,
+          // HEAD / 304 / 失败响应没有响应体：bytes=0，只计入请求数。
+          bytes:
+            headOnly || response.status === 304
+              ? 0
+              : Number(response.headers?.['content-length']) || 0,
+          ...(response.encoding ? { encoding: response.encoding } : {}),
+          ...(response.range ? { range: true } : {}),
         });
       }
       if (response.encoding) {
@@ -529,7 +547,12 @@ export async function handle(req, res) {
 const gcState = {
   enabled: false,
   mode: 'dry-run',
+  keepDays: null,
+  keepLast: null,
   lastRunAt: null,
+  lastCandidates: 0,
+  lastRemoved: 0,
+  lastBytes: 0,
   lastError: null,
 };
 
@@ -539,6 +562,10 @@ const STARTED_AT = new Date().toISOString();
 /** 遍历所有 runtimeVersion 跑一次规划；apply 模式下才真正删除。 */
 async function runGcOnce() {
   const cfg = gcConfig();
+  // 控制台可能刚改过覆盖配置：每次执行都同步一次，/healthz 与看板才不会显示旧值。
+  gcState.mode = cfg.mode;
+  gcState.keepDays = cfg.keepDays;
+  gcState.keepLast = cfg.keepLast;
   const versions = await runtimeVersions();
   let candidates = 0;
   let removed = 0;
@@ -563,6 +590,9 @@ async function runGcOnce() {
     }
   }
   gcState.lastRunAt = new Date().toISOString();
+  gcState.lastCandidates = candidates;
+  gcState.lastRemoved = removed;
+  gcState.lastBytes = bytes;
   console.log(
     `[ota] GC(${cfg.mode}): 候选 ${candidates} 个，回收 ${removed} 个 / ${bytes}B`,
   );
@@ -574,6 +604,8 @@ function scheduleGc() {
   const cfg = gcConfig();
   gcState.enabled = cfg.enabled;
   gcState.mode = cfg.mode;
+  gcState.keepDays = cfg.keepDays;
+  gcState.keepLast = cfg.keepLast;
   if (!cfg.enabled) return;
 
   console.log(
